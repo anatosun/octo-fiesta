@@ -26,7 +26,10 @@ public abstract class BaseDownloadService : IDownloadService
     protected readonly ILogger Logger;
     private readonly IServiceProvider _serviceProvider;
 
-    protected readonly string DownloadPath;
+    // A property, not a constructor field, so ProviderName is never read while a derived
+    // instance is still being built.
+    protected string DownloadPath => DownloadPathResolver.GetProviderPath(Configuration, ProviderName);
+
     protected readonly string CachePath;
 
     protected readonly Dictionary<string, DownloadInfo> ActiveDownloads = new();
@@ -36,6 +39,9 @@ public abstract class BaseDownloadService : IDownloadService
     // Key: "{provider}|{externalId}" -> (path or null, expiry)
     private readonly ConcurrentDictionary<string, (string? Path, DateTime Expiry)> _metadataPathCache = new();
     private readonly ConcurrentDictionary<string, SemaphoreSlim> _metadataPathLocks = new();
+
+    // Tracks queued for a quality upgrade, and those the provider cannot serve any higher
+    private readonly ConcurrentDictionary<string, byte> _pendingQualityUpgrades = new();
     private static readonly TimeSpan MetadataCacheTtl = TimeSpan.FromMinutes(5);
     private static readonly TimeSpan MetadataCacheNegativeTtl = TimeSpan.FromMinutes(1);
     private readonly IHttpClientFactory _httpClientFactory;
@@ -89,13 +95,7 @@ public abstract class BaseDownloadService : IDownloadService
         _serviceProvider = serviceProvider;
         Logger = logger;
 
-        DownloadPath = configuration["Library:DownloadPath"] ?? "./downloads";
         CachePath = PathHelper.GetCachePath();
-
-        if (!Directory.Exists(DownloadPath))
-        {
-            Directory.CreateDirectory(DownloadPath);
-        }
 
         if (!Directory.Exists(CachePath))
         {
@@ -174,6 +174,58 @@ public abstract class BaseDownloadService : IDownloadService
                 Logger.LogError(ex, "Failed to download remaining album tracks for album {AlbumId}", albumExternalId);
             }
         });
+    }
+
+    public void UpgradeQualityInBackground(string externalProvider, string externalId)
+    {
+        if (externalProvider != ProviderName)
+        {
+            return;
+        }
+
+        _ = Task.Run(() => UpgradeQualityAsync(externalId, triggerAlbumDownload: true));
+    }
+
+    private async Task UpgradeQualityAsync(string externalId, bool triggerAlbumDownload, CancellationToken cancellationToken = default)
+    {
+        var key = $"{ProviderName}:{externalId}";
+        if (!_pendingQualityUpgrades.TryAdd(key, 0))
+        {
+            return;
+        }
+
+        // The provider may simply not offer the target quality. In that case the key is
+        // left in place so later plays stop re-downloading the same track for nothing.
+        var upgradeUnavailable = false;
+        try
+        {
+            var mapping = await LocalLibraryService.GetMappingForExternalSongAsync(ProviderName, externalId);
+            if (mapping == null || !IsQualityUpgradeAvailable(mapping.DownloadedQuality))
+            {
+                return;
+            }
+
+            await DownloadSongInternalAsync(ProviderName, externalId, triggerAlbumDownload, cancellationToken: cancellationToken);
+
+            var upgraded = await LocalLibraryService.GetMappingForExternalSongAsync(ProviderName, externalId);
+            upgradeUnavailable = upgraded != null && IsQualityUpgradeAvailable(upgraded.DownloadedQuality);
+            if (upgradeUnavailable)
+            {
+                Logger.LogInformation("{Provider}:{ExternalId} is not available above {Quality}, giving up on the upgrade",
+                    ProviderName, externalId, upgraded!.DownloadedQuality ?? "unknown");
+            }
+        }
+        catch (Exception ex)
+        {
+            Logger.LogError(ex, "Quality upgrade failed for {Provider}:{ExternalId}", ProviderName, externalId);
+        }
+        finally
+        {
+            if (!upgradeUnavailable)
+            {
+                _pendingQualityUpgrades.TryRemove(key, out _);
+            }
+        }
     }
 
     public void DownloadFullAlbumInBackground(string externalProvider, string albumExternalId)
@@ -412,6 +464,12 @@ public abstract class BaseDownloadService : IDownloadService
     /// </summary>
     protected abstract string? GetTargetQuality();
 
+    private bool IsQualityUpgradeAvailable(string? downloadedQuality)
+    {
+        return SubsonicSettings.AutoUpgradeQuality
+            && QualityHelper.ShouldUpgrade(downloadedQuality, GetTargetQuality());
+    }
+
     #endregion
 
     #region Common Download Logic
@@ -459,8 +517,7 @@ public abstract class BaseDownloadService : IDownloadService
                 {
                     // Check if we should upgrade quality
                     var targetQuality = GetTargetQuality();
-                    bool shouldUpgrade = SubsonicSettings.AutoUpgradeQuality
-                        && QualityHelper.ShouldUpgrade(existingMapping.DownloadedQuality, targetQuality);
+                    bool shouldUpgrade = IsQualityUpgradeAvailable(existingMapping.DownloadedQuality);
 
                     // No upgrade needed – return already downloaded path
                     if (!shouldUpgrade)
@@ -918,6 +975,7 @@ public abstract class BaseDownloadService : IDownloadService
                 if (existingPath != null && IOFile.Exists(existingPath))
                 {
                     Logger.LogDebug("Track {TrackId} already in library, skipping", track.ExternalId);
+                    await UpgradeQualityAsync(track.ExternalId!, triggerAlbumDownload: false, cancellationToken);
                     continue;
                 }
 

@@ -1,7 +1,8 @@
-using Microsoft.AspNetCore.Mvc;
+﻿using Microsoft.AspNetCore.Mvc;
 using System.Xml.Linq;
 using System.Text;
 using System.Text.Json;
+using System.Text.Json.Nodes;
 using Microsoft.Extensions.Options;
 using octo_fiesta.Models.Domain;
 using octo_fiesta.Models.Settings;
@@ -129,7 +130,9 @@ public class SubsonicController : ControllerBase
 
         var subsonicResult = await subsonicTask;
         var externalResult = await externalTask;
-        var playlistResult = await playlistTask;
+        // A provider that pads playlist search rather than returning nothing puts
+        // unrelated entries in the album section. Keep only what answers the query.
+        var playlistResult = PlaylistRelevanceFilter.Apply(cleanQuery, await playlistTask);
 
         return MergeSearchResults(subsonicResult, externalResult, playlistResult, format);
     }
@@ -154,37 +157,60 @@ public class SubsonicController : ControllerBase
 
         if (!isExternal)
         {
+            // A track the library already holds is played by its Subsonic id, which never
+            // reaches the download path where quality upgrades happen.
+            if (_subsonicSettings.AutoUpgradeQuality)
+            {
+                await QueueQualityUpgradeAsync(id);
+            }
+
             return await _proxyService.RelayStreamAsync(parameters, HttpContext.RequestAborted);
         }
 
-        // Serve an already-owned copy from the library instead of re-downloading.
-        // Skipped when AutoUpgradeQuality is on so the download path can still
-        // upgrade a lower-quality local copy on play.
-        if (!_subsonicSettings.AutoUpgradeQuality)
+        // Serve an already-owned copy from the library instead of re-downloading. A copy
+        // below the target quality is still served right away, the upgrade runs in background.
+        var ownedSongId = await _localLibraryService.GetLocalIdForExternalSongAsync(provider!, externalId!);
+        if (!string.IsNullOrEmpty(ownedSongId))
         {
-            var localSongId = await _localLibraryService.GetLocalIdForExternalSongAsync(provider!, externalId!);
-            if (!string.IsNullOrEmpty(localSongId))
+            if (_subsonicSettings.AutoUpgradeQuality)
             {
-                parameters["id"] = localSongId;
-                return await _proxyService.RelayStreamAsync(parameters, HttpContext.RequestAborted);
+                _downloadService.UpgradeQualityInBackground(provider!, externalId!);
             }
+
+            parameters["id"] = ownedSongId;
+            return await _proxyService.RelayStreamAsync(parameters, HttpContext.RequestAborted);
         }
 
         // Otherwise download from the provider and stream (quality upgrade logic applies)
         try
         {
-            // Allow cancellation from both client disconnect and application shutdown
-            using var cancellationTokenSource = CancellationTokenSource.CreateLinkedTokenSource(
-                HttpContext.RequestAborted,
-                _hostApplicationLifetime.ApplicationStopping);
-
-            var (downloadStream, filePath) = await _downloadService.DownloadAndStreamAsync(provider!, externalId!, cancellationTokenSource.Token);
+            // The download is deliberately not tied to RequestAborted. Nothing is sent to the
+            // client until the file is complete, so a client that gives up waiting would kill
+            // the download, drop the partial file, and restart from zero on every retry. Only
+            // application shutdown cancels it.
+            var (downloadStream, filePath) = await _downloadService.DownloadAndStreamAsync(
+                provider!, externalId!, _hostApplicationLifetime.ApplicationStopping);
             return File(downloadStream, GetContentType(filePath), enableRangeProcessing: true);
         }
         catch (Exception ex)
         {
             return StatusCode(500, new { error = $"Failed to stream: {ex.Message}" });
         }
+    }
+
+    /// <summary>
+    /// Queues the re-download of a library track below the target quality. Playback is served
+    /// from the copy at hand, so the client never waits for the upgrade to finish.
+    /// </summary>
+    private async Task QueueQualityUpgradeAsync(string localSongId)
+    {
+        var owned = await _localLibraryService.GetMappingForLocalIdAsync(localSongId);
+        if (owned == null)
+        {
+            return;
+        }
+
+        _downloadService.UpgradeQualityInBackground(owned.ExternalProvider, owned.ExternalId);
     }
 
     /// <summary>
@@ -595,6 +621,133 @@ public class SubsonicController : ControllerBase
         return longer.Length > shorter.Length
             && longer.StartsWith(shorter, StringComparison.Ordinal)
             && !char.IsLetterOrDigit(longer[shorter.Length]);
+    }
+
+    /// <summary>
+    /// Merges the provider catalogue into an artist's top songs.
+    /// </summary>
+    /// <remarks>
+    /// Navidrome answers getTopSongs by intersecting the Last.fm ranking with the
+    /// local library, so a sparse library returns one or two titles even when the
+    /// provider carries the whole discography. Without this route the call fell
+    /// through to the catch-all proxy and external results never reached the client.
+    /// </remarks>
+    [HttpGet, HttpPost]
+    [Route("rest/getTopSongs")]
+    [Route("rest/getTopSongs.view")]
+    public async Task<IActionResult> GetTopSongs()
+    {
+        var parameters = await ExtractAllParameters();
+        var artistName = parameters.GetValueOrDefault("artist", "");
+        var format = parameters.GetValueOrDefault("f", "xml");
+
+        if (string.IsNullOrWhiteSpace(artistName))
+        {
+            return _responseBuilder.CreateError(format, 10, "Missing artist parameter");
+        }
+
+        var count = int.TryParse(parameters.GetValueOrDefault("count", "50"), out var parsedCount) && parsedCount > 0
+            ? parsedCount
+            : 50;
+
+        var navidromeTask = _proxyService.RelaySafeAsync("rest/getTopSongs", parameters);
+        var externalTask = SearchArtistCatalogSafeAsync(artistName, count);
+
+        await Task.WhenAll(navidromeTask, externalTask);
+
+        var navidromeResult = await navidromeTask;
+        var externalSongs = await externalTask;
+
+        if (!navidromeResult.Success || navidromeResult.Body == null)
+        {
+            return _responseBuilder.CreateResponse(format, "topSongs", new { });
+        }
+
+        // The merge below only builds JSON, so XML clients keep the untouched
+        // relay. Same contract as getArtist.
+        var isJson = format == "json" || navidromeResult.ContentType?.Contains("json") == true;
+        if (!isJson)
+        {
+            return File(navidromeResult.Body, navidromeResult.ContentType ?? "application/xml");
+        }
+
+        var mergedSongs = new List<object>();
+        var seenTitles = new HashSet<string>();
+
+        try
+        {
+            using var jsonDoc = JsonDocument.Parse(Encoding.UTF8.GetString(navidromeResult.Body));
+            if (jsonDoc.RootElement.TryGetProperty("subsonic-response", out var response) &&
+                response.TryGetProperty("topSongs", out var topSongs) &&
+                topSongs.TryGetProperty("song", out var songs) &&
+                songs.ValueKind == JsonValueKind.Array)
+            {
+                foreach (var song in songs.EnumerateArray())
+                {
+                    mergedSongs.Add(_responseBuilder.ConvertSubsonicJsonElement(song, true));
+
+                    if (song.TryGetProperty("title", out var title))
+                    {
+                        seenTitles.Add(StringNormalizer.CreateComparisonKey(title.GetString()));
+                    }
+                }
+            }
+        }
+        catch (JsonException)
+        {
+            return File(navidromeResult.Body, navidromeResult.ContentType ?? "application/json");
+        }
+
+        foreach (var song in externalSongs)
+        {
+            if (mergedSongs.Count >= count)
+            {
+                break;
+            }
+
+            if (!IsSameArtistOrCollaboration(song.Artist, artistName))
+            {
+                continue;
+            }
+
+            if (!seenTitles.Add(StringNormalizer.CreateComparisonKey(song.Title)))
+            {
+                continue;
+            }
+
+            mergedSongs.Add(_responseBuilder.ConvertSongToJson(song));
+        }
+
+        if (mergedSongs.Count > count)
+        {
+            mergedSongs = mergedSongs.Take(count).ToList();
+        }
+
+        return _responseBuilder.CreateJsonResponse(new
+        {
+            status = "ok",
+            version = "1.16.1",
+            topSongs = new { song = mergedSongs }
+        });
+    }
+
+    /// <summary>
+    /// Looks the artist up on the provider. A provider outage must not cost the
+    /// user the local songs, so failures degrade to an empty list.
+    /// </summary>
+    private async Task<List<Song>> SearchArtistCatalogSafeAsync(string artistName, int count)
+    {
+        try
+        {
+            // Ask wide: the provider ranks by relevance to the query, which mixes in
+            // namesakes, and IsSameArtistOrCollaboration filters those out afterwards.
+            return await _metadataService.SearchSongsAsync(artistName, Math.Max(count, 20) * 2);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "getTopSongs: provider lookup failed for {Artist}", artistName);
+            return new List<Song>();
+        }
     }
 
     /// <summary>
@@ -1647,8 +1800,57 @@ public class SubsonicController : ControllerBase
             {
                 return StatusCode(result.StatusCode);
             }
-            
+
+            foreach (var header in result.Headers)
+            {
+                Response.Headers[header.Key] = header.Value;
+            }
+
             var contentType = result.ContentType ?? "application/xml; charset=utf-8";
+            // Navidrome supports playbackReport, but external IDs have no Navidrome record
+            // until a download is indexed. Do not advertise an extension the proxy cannot
+            // honor for every song; clients still use the standard scrobble endpoint.
+            if (endpoint.Equals("rest/getOpenSubsonicExtensions", StringComparison.OrdinalIgnoreCase) ||
+                endpoint.Equals("rest/getOpenSubsonicExtensions.view", StringComparison.OrdinalIgnoreCase))
+            {
+                var isJsonp = contentType.Contains("javascript", StringComparison.OrdinalIgnoreCase) ||
+                    contentType.Contains("jsonp", StringComparison.OrdinalIgnoreCase);
+                if (isJsonp || contentType.Contains("json", StringComparison.OrdinalIgnoreCase))
+                {
+                    var body = Encoding.UTF8.GetString(result.Body);
+                    var jsonStart = 0;
+                    var jsonEnd = body.Length;
+                    if (isJsonp)
+                    {
+                        jsonStart = body.IndexOf('(') + 1;
+                        jsonEnd = body.LastIndexOf(')');
+                        if (jsonStart == 0 || jsonEnd <= jsonStart)
+                        {
+                            return File(result.Body, contentType);
+                        }
+                    }
+
+                    var response = JsonNode.Parse(body[jsonStart..jsonEnd])!;
+                    if (response["subsonic-response"]?["openSubsonicExtensions"] is JsonArray extensions)
+                    {
+                        for (var i = extensions.Count - 1; i >= 0; i--)
+                        {
+                            if (extensions[i]?["name"]?.GetValue<string>() == "playbackReport")
+                            {
+                                extensions.RemoveAt(i);
+                            }
+                        }
+                    }
+                    var filteredBody = body[..jsonStart] + response.ToJsonString() + body[jsonEnd..];
+                    return File(Encoding.UTF8.GetBytes(filteredBody), contentType);
+                }
+
+                var xml = XDocument.Parse(Encoding.UTF8.GetString(result.Body));
+                xml.Root?.Elements().Where(e => e.Name.LocalName == "openSubsonicExtensions" &&
+                    (string?)e.Attribute("name") == "playbackReport").Remove();
+                return File(Encoding.UTF8.GetBytes(xml.ToString(SaveOptions.DisableFormatting)), contentType);
+            }
+
             return File(result.Body, contentType);
         }
         catch (HttpRequestException ex)

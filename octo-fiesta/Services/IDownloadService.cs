@@ -38,6 +38,14 @@ public interface IDownloadService
     /// <param name="cancellationToken">Cancellation token</param>
     /// <returns>A stream of the audio file together with its local path (used to determine the content type)</returns>
     Task<(Stream Stream, string FilePath)> DownloadAndStreamAsync(string externalProvider, string externalId, CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Re-downloads an already owned track at the configured target quality, detached from
+    /// any request. Does nothing when the track is already at that quality or better.
+    /// </summary>
+    /// <param name="externalProvider">The provider (deezer, qobuz, etc.)</param>
+    /// <param name="externalId">The ID on the external provider</param>
+    void UpgradeQualityInBackground(string externalProvider, string externalId);
     
     /// <summary>
     /// Downloads remaining tracks from an album in background (excluding the specified track)

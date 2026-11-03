@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Text.Json;
 using Microsoft.Extensions.Options;
 using octo_fiesta.Models.Domain;
@@ -18,16 +19,22 @@ public class LocalLibraryService : ILocalLibraryService
 {
     private readonly string _mappingFilePath;
     private readonly string _downloadDirectory;
+    private readonly IReadOnlyList<string> _libraryRoots;
     private readonly HttpClient _httpClient;
     private readonly IMusicMetadataService _metadataService;
     private readonly SubsonicSettings _subsonicSettings;
     private readonly ILogger<LocalLibraryService> _logger;
     private Dictionary<string, LocalSongMapping>? _mappings;
+
+    private readonly ConcurrentDictionary<string, byte> _localIdsWithoutMapping = new();
     private readonly SemaphoreSlim _lock = new(1, 1);
     
     // Debounce to avoid triggering too many scans
     private DateTime _lastScanTrigger = DateTime.MinValue;
-    private readonly TimeSpan _scanDebounceInterval = TimeSpan.FromSeconds(30);
+    internal TimeSpan ScanDebounceInterval { get; set; } = TimeSpan.FromSeconds(30);
+
+    private readonly object _trailingScanGate = new();
+    private bool _trailingScanPending;
     
     // Primary subsonic auth parameters/credentials from config for server-to-server calls
     private SubsonicCredentials? _subsonicAdminCredentials;
@@ -48,7 +55,9 @@ public class LocalLibraryService : ILocalLibraryService
         IOptions<SubsonicSettings> subsonicSettings,
         ILogger<LocalLibraryService> logger)
     {
-        _downloadDirectory = configuration["Library:DownloadPath"] ?? Path.Combine(Directory.GetCurrentDirectory(), "downloads");
+        // Shared path, so a per-provider override does not split the mapping registry in two.
+        _downloadDirectory = DownloadPathResolver.GetSharedPath(configuration);
+        _libraryRoots = DownloadPathResolver.GetAllRoots(configuration);
         _mappingFilePath = Path.Combine(_downloadDirectory, ".mappings.json");
         _httpClient = httpClientFactory.CreateClient();
         _metadataService = metadataService;
@@ -125,12 +134,10 @@ public class LocalLibraryService : ILocalLibraryService
             var mappings = await LoadMappingsAsync();
             mappings.TryGetValue($"{externalProvider}:{externalId}", out var mapping);
 
-            string? title;
-            string? artist;
+            TrackInfo external;
             if (mapping != null)
             {
-                title = mapping.Title;
-                artist = mapping.Artist;
+                external = new TrackInfo(mapping.Title, mapping.Artist);
             }
             else
             {
@@ -140,18 +147,19 @@ public class LocalLibraryService : ILocalLibraryService
                     return matches;
                 }
 
-                title = externalSong.Title;
-                artist = externalSong.Artist;
+                external = new TrackInfo(externalSong.Title, externalSong.Artist, externalSong.Duration, externalSong.Isrc);
             }
 
-            var queryText = string.Join(" ", new[] { artist, title });
+            // Edition labels ("Album Version", "Explicit") and featured artists are left out of
+            // the query: Subsonic servers match every term, and library tags often lack them.
+            var queryText = string.Join(" ", new[] { TrackMatcher.PrimaryArtist(external.Artist), TrackMatcher.CleanTitle(external.Title) });
             if (string.IsNullOrWhiteSpace(queryText))
             {
                 return matches;
             }
 
             var authQuery = BuildAuthQuery(_subsonicUserCredentials);
-            var searchUrl = $"{_subsonicSettings.Url}/rest/search3?f=json&songCount=10&albumCount=0&artistCount=0&query={Uri.EscapeDataString(queryText)}{authQuery}";
+            var searchUrl = $"{_subsonicSettings.Url}/rest/search3?f=json&songCount=20&albumCount=0&artistCount=0&query={Uri.EscapeDataString(queryText)}{authQuery}";
 
             var response = await _httpClient.GetAsync(searchUrl);
             if (!response.IsSuccessStatusCode)
@@ -171,21 +179,12 @@ public class LocalLibraryService : ILocalLibraryService
                 return matches;
             }
 
-            var titleKey = StringNormalizer.CreateComparisonKey(title);
-            var artistKey = StringNormalizer.CreateComparisonKey(artist);
-
             foreach (var songElement in EnumerateSongs(songNode))
             {
-                var candidateTitleKey = StringNormalizer.CreateComparisonKey(songElement.TryGetProperty("title", out var titleEl) ? titleEl.GetString() : null);
-                var candidateArtistKey = StringNormalizer.CreateComparisonKey(songElement.TryGetProperty("artist", out var artistEl) ? artistEl.GetString() : null);
-
-                var titleMatches = !string.IsNullOrEmpty(titleKey) && titleKey == candidateTitleKey;
-                var artistMatches = !string.IsNullOrEmpty(artistKey) && artistKey == candidateArtistKey;
-
                 // Require both title and artist. Matching on title+album alone let a different
                 // recording from a compilation (same title, different artist) pass as "owned",
                 // and that wrong file then got persisted into the M3U and the library.
-                if (titleMatches && artistMatches)
+                if (TrackMatcher.IsMatch(external, ReadTrackInfo(songElement)))
                 {
                     matches.Add(songElement.Clone());
                 }
@@ -201,7 +200,8 @@ public class LocalLibraryService : ILocalLibraryService
 
     /// <summary>
     /// Translates a Subsonic search hit's (tag-derived) path into the real on-disk path inside
-    /// our download directory, or null if the file isn't there (e.g. a stale "ghost" entry).
+    /// one of our download directories, or null if the file isn't there (e.g. a stale "ghost"
+    /// entry).
     /// Navidrome's reported path can diverge from the file Octo actually wrote: tags may contain
     /// characters Octo sanitizes on disk (e.g. ':' -> '_'), and the name can carry a synthetic
     /// disc prefix ("01-05 - X") the real file lacks ("05 - X"). Rebuild segment by segment with
@@ -226,24 +226,27 @@ public class LocalLibraryService : ILocalLibraryService
             return null;
         }
 
-        var directory = _downloadDirectory;
-        for (var p = 0; p < parts.Length - 1; p++)
-        {
-            directory = Path.Combine(directory, PathHelper.SanitizeFolderName(parts[p]));
-        }
-
         var rawName = parts[^1];
         var extension = Path.GetExtension(rawName);
         var stem = Path.GetFileNameWithoutExtension(rawName);
         var discStripped = System.Text.RegularExpressions.Regex.Replace(stem, @"^\d+-", "");
         var candidateStems = stem == discStripped ? new[] { stem } : new[] { stem, discStripped };
 
-        foreach (var candidateStem in candidateStems)
+        foreach (var root in _libraryRoots)
         {
-            var candidatePath = Path.Combine(directory, PathHelper.SanitizeFileName(candidateStem) + extension);
-            if (File.Exists(candidatePath))
+            var directory = root;
+            for (var p = 0; p < parts.Length - 1; p++)
             {
-                return candidatePath;
+                directory = Path.Combine(directory, PathHelper.SanitizeFolderName(parts[p]));
+            }
+
+            foreach (var candidateStem in candidateStems)
+            {
+                var candidatePath = Path.Combine(directory, PathHelper.SanitizeFileName(candidateStem) + extension);
+                if (File.Exists(candidatePath))
+                {
+                    return candidatePath;
+                }
             }
         }
 
@@ -350,6 +353,105 @@ public class LocalLibraryService : ILocalLibraryService
         return matchedId;
     }
 
+    public async Task<LocalSongMapping?> GetMappingForLocalIdAsync(string localSubsonicId)
+    {
+        if (string.IsNullOrEmpty(localSubsonicId) || _localIdsWithoutMapping.ContainsKey(localSubsonicId))
+        {
+            return null;
+        }
+
+        var mappings = await LoadMappingsAsync();
+
+        var resolved = mappings.Values.FirstOrDefault(m =>
+            string.Equals(m.LocalSubsonicId, localSubsonicId, StringComparison.Ordinal));
+        if (resolved != null)
+        {
+            return File.Exists(resolved.LocalPath) ? resolved : null;
+        }
+
+        // A library built by earlier versions carries no LocalSubsonicId at all, so fall back
+        // to matching on tags.
+        var unresolved = mappings.Values
+            .Where(m => string.IsNullOrEmpty(m.LocalSubsonicId))
+            .ToList();
+
+        if (unresolved.Count == 0)
+        {
+            _localIdsWithoutMapping.TryAdd(localSubsonicId, 0);
+            return null;
+        }
+
+        var tags = await GetLibrarySongTagsAsync(localSubsonicId);
+        if (tags == null)
+        {
+            return null;
+        }
+
+        var titleKey = StringNormalizer.CreateComparisonKey(tags.Value.Title);
+        var artistKey = StringNormalizer.CreateComparisonKey(tags.Value.Artist);
+
+        var match = unresolved.FirstOrDefault(m =>
+            StringNormalizer.CreateComparisonKey(m.Title) == titleKey &&
+            StringNormalizer.CreateComparisonKey(m.Artist) == artistKey);
+
+        if (match == null)
+        {
+            _localIdsWithoutMapping.TryAdd(localSubsonicId, 0);
+            return null;
+        }
+
+        await _lock.WaitAsync();
+        try
+        {
+            if (mappings.TryGetValue($"{match.ExternalProvider}:{match.ExternalId}", out var mappingToUpdate))
+            {
+                mappingToUpdate.LocalSubsonicId = localSubsonicId;
+                await SaveMappingsAsync(mappings);
+            }
+        }
+        finally
+        {
+            _lock.Release();
+        }
+
+        _logger.LogInformation("Local song {LocalId} belongs to {Provider}:{ExternalId} downloaded in {Quality}",
+            localSubsonicId, match.ExternalProvider, match.ExternalId, match.DownloadedQuality ?? "unknown");
+
+        return File.Exists(match.LocalPath) ? match : null;
+    }
+
+    private async Task<(string Title, string Artist)?> GetLibrarySongTagsAsync(string localSubsonicId)
+    {
+        try
+        {
+            var authQuery = BuildAuthQuery(_subsonicUserCredentials);
+            var url = $"{_subsonicSettings.Url}/rest/getSong?f=json&id={Uri.EscapeDataString(localSubsonicId)}{authQuery}";
+
+            var response = await _httpClient.GetAsync(url);
+            if (!response.IsSuccessStatusCode)
+            {
+                return null;
+            }
+
+            using var doc = JsonDocument.Parse(await response.Content.ReadAsStringAsync());
+            if (!doc.RootElement.TryGetProperty("subsonic-response", out var subsonicResponse) ||
+                !subsonicResponse.TryGetProperty("song", out var song))
+            {
+                return null;
+            }
+
+            var title = song.TryGetProperty("title", out var titleEl) ? titleEl.GetString() : null;
+            var artist = song.TryGetProperty("artist", out var artistEl) ? artistEl.GetString() : null;
+
+            return string.IsNullOrEmpty(title) || string.IsNullOrEmpty(artist) ? null : (title, artist);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "Could not read library tags for {LocalId}", localSubsonicId);
+            return null;
+        }
+    }
+
     public async Task<string?> WaitForLocalIdAfterScanAsync(string externalProvider, string externalId, CancellationToken cancellationToken = default)
     {
         var localId = await GetLocalIdForExternalSongAsync(externalProvider, externalId);
@@ -359,7 +461,7 @@ public class LocalLibraryService : ILocalLibraryService
         }
 
         var now = DateTime.UtcNow;
-        var debounceRemaining = _scanDebounceInterval - (now - _lastScanTrigger);
+        var debounceRemaining = ScanDebounceInterval - (now - _lastScanTrigger);
 
         var scanTriggered = await TriggerLibraryScanAsync();
         if (!scanTriggered)
@@ -389,6 +491,51 @@ public class LocalLibraryService : ILocalLibraryService
 
         await WaitForScanToFinishAsync(cancellationToken);
         return await GetLocalIdForExternalSongAsync(externalProvider, externalId);
+    }
+
+    /// <summary>
+    /// Reads the tags of a Subsonic song element, including the OpenSubsonic "artists" and
+    /// "isrc" arrays when the server provides them.
+    /// </summary>
+    private static TrackInfo ReadTrackInfo(JsonElement song)
+    {
+        string? GetString(string name) =>
+            song.TryGetProperty(name, out var el) && el.ValueKind == JsonValueKind.String ? el.GetString() : null;
+
+        int? duration = song.TryGetProperty("duration", out var durationEl) && durationEl.ValueKind == JsonValueKind.Number &&
+                        durationEl.TryGetInt32(out var seconds)
+            ? seconds
+            : null;
+
+        var artists = new List<string>();
+        if (song.TryGetProperty("artists", out var artistsEl) && artistsEl.ValueKind == JsonValueKind.Array)
+        {
+            foreach (var a in artistsEl.EnumerateArray())
+            {
+                if (a.ValueKind == JsonValueKind.Object && a.TryGetProperty("name", out var nameEl) &&
+                    nameEl.ValueKind == JsonValueKind.String && !string.IsNullOrEmpty(nameEl.GetString()))
+                {
+                    artists.Add(nameEl.GetString()!);
+                }
+            }
+        }
+
+        var isrcs = new List<string>();
+        if (song.TryGetProperty("isrc", out var isrcEl))
+        {
+            if (isrcEl.ValueKind == JsonValueKind.Array)
+            {
+                isrcs.AddRange(isrcEl.EnumerateArray()
+                    .Where(i => i.ValueKind == JsonValueKind.String && !string.IsNullOrEmpty(i.GetString()))
+                    .Select(i => i.GetString()!));
+            }
+            else if (isrcEl.ValueKind == JsonValueKind.String && !string.IsNullOrEmpty(isrcEl.GetString()))
+            {
+                isrcs.Add(isrcEl.GetString()!);
+            }
+        }
+
+        return new TrackInfo(GetString("title"), GetString("artist"), duration, ArtistNames: artists, IsrcList: isrcs);
     }
 
     private static IEnumerable<JsonElement> EnumerateSongs(JsonElement songNode)
@@ -746,16 +893,25 @@ public class LocalLibraryService : ILocalLibraryService
         }
         
         // Debounce: avoid triggering too many successive scans
-        var now = DateTime.UtcNow;
-        if (now - _lastScanTrigger < _scanDebounceInterval)
+        var debounceRemaining = ScanDebounceInterval - (DateTime.UtcNow - _lastScanTrigger);
+        if (debounceRemaining > TimeSpan.Zero)
         {
-            _logger.LogDebug("Scan debounced - last scan was {Elapsed}s ago", 
-                (now - _lastScanTrigger).TotalSeconds);
+            _logger.LogDebug("Scan debounced - trailing scan in {Delay}s",
+                Math.Ceiling(debounceRemaining.TotalSeconds));
+            ScheduleTrailingScan(debounceRemaining);
             return true;
         }
-        
-        _lastScanTrigger = now;
-        
+
+        // A startScan issued while a scan is already running is ignored by the server
+        var runningScan = await GetScanStatusAsync();
+        if (runningScan?.Scanning == true)
+        {
+            _logger.LogDebug("A library scan is already running, waiting for it to finish before scanning again");
+            await WaitForScanToFinishAsync(CancellationToken.None);
+        }
+
+        _lastScanTrigger = DateTime.UtcNow;
+
         try
         {
             var authQuery = BuildAuthQuery(requestCredentials);
@@ -782,6 +938,42 @@ public class LocalLibraryService : ILocalLibraryService
             _logger.LogError(ex, "Error triggering Subsonic library scan");
             return false;
         }
+    }
+
+    /// <summary>
+    /// Arms a single scan for when the debounce window expires, so the last change of a
+    /// batch is scanned instead of being dropped with the request that was debounced.
+    /// </summary>
+    private void ScheduleTrailingScan(TimeSpan delay)
+    {
+        lock (_trailingScanGate)
+        {
+            if (_trailingScanPending)
+            {
+                return;
+            }
+
+            _trailingScanPending = true;
+        }
+
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                await Task.Delay(delay);
+
+                lock (_trailingScanGate)
+                {
+                    _trailingScanPending = false;
+                }
+
+                await TriggerLibraryScanAsync();
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Failed to run trailing library scan");
+            }
+        });
     }
 
     public async Task<ScanStatus?> GetScanStatusAsync()

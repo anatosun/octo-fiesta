@@ -1029,6 +1029,95 @@ public class LocalLibraryServiceTests : IDisposable
             });
     }
 
+    [Fact]
+    public async Task TriggerLibraryScanAsync_WhenDebounced_RunsTrailingScan()
+    {
+        var service = BuildService(adminUsername: "admin", adminPassword: "secret");
+        service.ScanDebounceInterval = TimeSpan.FromMilliseconds(200);
+
+        var scanCount = 0;
+        _mockHandler.Protected()
+            .Setup<Task<HttpResponseMessage>>("SendAsync",
+                ItExpr.IsAny<HttpRequestMessage>(), ItExpr.IsAny<CancellationToken>())
+            .ReturnsAsync((HttpRequestMessage req, CancellationToken _) =>
+            {
+                var url = req.RequestUri?.ToString() ?? "";
+                if (url.Contains("getUser"))
+                {
+                    return new HttpResponseMessage(HttpStatusCode.OK)
+                    {
+                        Content = new StringContent("{\"subsonic-response\":{\"status\":\"ok\",\"user\":{\"adminRole\":true}}}")
+                    };
+                }
+
+                if (url.Contains("startScan"))
+                {
+                    Interlocked.Increment(ref scanCount);
+                }
+
+                return new HttpResponseMessage(HttpStatusCode.OK)
+                {
+                    Content = new StringContent("{\"subsonic-response\":{\"status\":\"ok\",\"scanStatus\":{\"scanning\":false}}}")
+                };
+            });
+
+        await service.TriggerLibraryScanAsync();
+        await service.TriggerLibraryScanAsync();
+
+        Assert.Equal(1, Volatile.Read(ref scanCount));
+
+        await Task.Delay(TimeSpan.FromSeconds(1));
+
+        Assert.Equal(2, Volatile.Read(ref scanCount));
+    }
+
+    [Fact]
+    public async Task TriggerLibraryScanAsync_WhenServerIsAlreadyScanning_WaitsForItToFinish()
+    {
+        var service = BuildService(adminUsername: "admin", adminPassword: "secret");
+
+        var statusCalls = 0;
+        var statusCallsWhenScanned = 0;
+        _mockHandler.Protected()
+            .Setup<Task<HttpResponseMessage>>("SendAsync",
+                ItExpr.IsAny<HttpRequestMessage>(), ItExpr.IsAny<CancellationToken>())
+            .ReturnsAsync((HttpRequestMessage req, CancellationToken _) =>
+            {
+                var url = req.RequestUri?.ToString() ?? "";
+                if (url.Contains("getUser"))
+                {
+                    return new HttpResponseMessage(HttpStatusCode.OK)
+                    {
+                        Content = new StringContent("{\"subsonic-response\":{\"status\":\"ok\",\"user\":{\"adminRole\":true}}}")
+                    };
+                }
+
+                if (url.Contains("getScanStatus"))
+                {
+                    var scanning = Interlocked.Increment(ref statusCalls) <= 2 ? "true" : "false";
+                    return new HttpResponseMessage(HttpStatusCode.OK)
+                    {
+                        Content = new StringContent("{\"subsonic-response\":{\"status\":\"ok\",\"scanStatus\":{\"scanning\":" + scanning + "}}}")
+                    };
+                }
+
+                if (url.Contains("startScan"))
+                {
+                    statusCallsWhenScanned = Volatile.Read(ref statusCalls);
+                }
+
+                return new HttpResponseMessage(HttpStatusCode.OK)
+                {
+                    Content = new StringContent("{\"subsonic-response\":{\"status\":\"ok\"}}")
+                };
+            });
+
+        var result = await service.TriggerLibraryScanAsync();
+
+        Assert.True(result);
+        Assert.Equal(3, statusCallsWhenScanned);
+    }
+
     private LocalLibraryService BuildService(
         string? adminUsername = null,
         string? adminPassword = null,
@@ -1058,5 +1147,53 @@ public class LocalLibraryServiceTests : IDisposable
             subsonicSettings,
             mockLogger.Object
         );
+    }
+
+    [Fact]
+    public async Task GetLocalIdForExternalSongAsync_LibraryTagsWithoutEditionLabels_ResolvesOwnedCopy()
+    {
+        _mockMetadataService
+            .Setup(x => x.GetSongAsync("qobuz", "42"))
+            .ReturnsAsync(new Song
+            {
+                Title = "Welcome To Heartbreak (Album Version)",
+                Artist = "Kanye West",
+                Duration = 262,
+                ExternalProvider = "qobuz",
+                ExternalId = "42"
+            });
+
+        string? searchUrl = null;
+        _mockHandler.Protected()
+            .Setup<Task<HttpResponseMessage>>("SendAsync",
+                ItExpr.IsAny<HttpRequestMessage>(),
+                ItExpr.IsAny<CancellationToken>())
+            .ReturnsAsync((HttpRequestMessage req, CancellationToken _) =>
+            {
+                var url = req.RequestUri?.ToString() ?? "";
+                if (url.Contains("search3"))
+                {
+                    searchUrl = url;
+                    return new HttpResponseMessage(HttpStatusCode.OK)
+                    {
+                        Content = new StringContent("{\"subsonic-response\":{\"searchResult3\":{\"song\":[" +
+                            "{\"id\":\"cover\",\"title\":\"Welcome To Heartbreak (Piano Version)\",\"artist\":\"Kanye West\",\"duration\":180}," +
+                            "{\"id\":\"owned\",\"title\":\"Welcome To Heartbreak\",\"artist\":\"Kanye West, Kid Cudi\",\"duration\":263}" +
+                            "]}}}")
+                    };
+                }
+
+                return new HttpResponseMessage(HttpStatusCode.OK)
+                {
+                    Content = new StringContent("{\"subsonic-response\":{\"status\":\"ok\"}}")
+                };
+            });
+
+        var result = await _service.GetLocalIdForExternalSongAsync("qobuz", "42");
+
+        Assert.Equal("owned", result);
+        Assert.NotNull(searchUrl);
+        Assert.Contains("query=Kanye West Welcome To Heartbreak", Uri.UnescapeDataString(searchUrl));
+        Assert.DoesNotContain("Album", searchUrl);
     }
 }
