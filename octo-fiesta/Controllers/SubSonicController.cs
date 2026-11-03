@@ -112,6 +112,21 @@ public class SubsonicController : ControllerBase
             }
         }
 
+        // A barcode (UPC/EAN) query asks for the one album carrying it, e.g. a client
+        // resolving a MusicBrainz release; a text search on the digits would only add noise.
+        if (BarcodeHelper.IsBarcode(cleanQuery))
+        {
+            var barcodeSubsonicTask = _proxyService.RelaySafeAsync("rest/search3", parameters);
+            var barcodeAlbum = await _metadataService.GetAlbumByBarcodeAsync(cleanQuery);
+            var barcodeResult = new SearchResult();
+            if (barcodeAlbum != null)
+            {
+                barcodeResult.Albums.Add(barcodeAlbum);
+            }
+
+            return MergeSearchResults(await barcodeSubsonicTask, barcodeResult, new List<ExternalPlaylist>(), format);
+        }
+
         var subsonicTask = _proxyService.RelaySafeAsync("rest/search3", parameters);
         var externalTask = _metadataService.SearchAllAsync(
             cleanQuery,
