@@ -135,7 +135,7 @@ public class QobuzOAuthTests : IDisposable
     }
 
     [Fact]
-    public async Task ExchangeOAuthCode_TokenFailsValidation_ThrowsAndKeepsStoredToken()
+    public async Task ExchangeOAuthCode_TokenUnauthorized_ThrowsAndKeepsStoredToken()
     {
         new QobuzTokenStore(StorePath).Save(new QobuzCredentials { UserAuthToken = "old", UserId = "1" });
         var svc = CreateService(new QobuzSettings(), HttpStatusCode.OK,
@@ -143,6 +143,18 @@ public class QobuzOAuthTests : IDisposable
 
         await Assert.ThrowsAsync<Exception>(() => svc.ExchangeOAuthCodeAsync("c"));
         Assert.Equal("old", new QobuzTokenStore(StorePath).Load()!.UserAuthToken);
+    }
+
+    [Fact]
+    public async Task ExchangeOAuthCode_CheckReturnsForbidden_StillStoresToken()
+    {
+        var svc = CreateService(new QobuzSettings(), HttpStatusCode.OK,
+            "{\"token\":\"new\",\"user_id\":\"2\"}", HttpStatusCode.Forbidden);
+
+        var creds = await svc.ExchangeOAuthCodeAsync("c");
+
+        Assert.Equal("new", creds.UserAuthToken);
+        Assert.Equal("new", new QobuzTokenStore(StorePath).Load()!.UserAuthToken);
     }
 
     [Fact]
