@@ -37,4 +37,23 @@ public class QobuzSettings
     /// Required when <see cref="AppId"/> is set.
     /// </summary>
     public string? AppSecret { get; set; }
+
+    /// <summary>
+    /// Path to the JSON file holding the token obtained through the OAuth login
+    /// (<c>/qobuz/oauth/login</c>). Must stay writable. When it holds a token, that token
+    /// takes precedence over <see cref="UserAuthToken"/> / <see cref="UserId"/>.
+    /// </summary>
+    public string TokenStore { get; set; } = "./qobuz-token.json";
+
+    /// <summary>
+    /// Optional OAuth private key. Extracted from the Qobuz web bundle when empty.
+    /// </summary>
+    public string? PrivateKey { get; set; }
+
+    /// <summary>
+    /// Optional absolute callback URL registered with the OAuth login, e.g.
+    /// https://octo.example.com/qobuz/oauth/callback. Derived from the incoming request
+    /// when empty; set it when running behind a reverse proxy that changes scheme or host.
+    /// </summary>
+    public string? OAuthRedirectUrl { get; set; }
 }

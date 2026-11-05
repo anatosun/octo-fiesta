@@ -36,6 +36,10 @@ public class QobuzDownloadService : BaseDownloadService
 
     protected override string ProviderName => "qobuz";
 
+    // The OAuth login stored on disk wins over the configured token; the configured values stay as fallback.
+    private string? CurrentUserAuthToken => _bundleService.GetCredentials()?.UserAuthToken ?? _userAuthToken;
+    private string? CurrentUserId => _bundleService.GetCredentials()?.UserId ?? _userId;
+
     public QobuzDownloadService(
         IHttpClientFactory httpClientFactory,
         IConfiguration configuration,
@@ -61,9 +65,9 @@ public class QobuzDownloadService : BaseDownloadService
 
     public override async Task<bool> IsAvailableAsync()
     {
-        if (string.IsNullOrEmpty(_userAuthToken) || string.IsNullOrEmpty(_userId))
+        if (string.IsNullOrEmpty(CurrentUserAuthToken) || string.IsNullOrEmpty(CurrentUserId))
         {
-            Logger.LogWarning("Qobuz user auth token or user ID not configured");
+            Logger.LogWarning("Qobuz user auth token or user ID not configured. Log in at /qobuz/oauth/login");
             return false;
         }
 
@@ -197,9 +201,10 @@ public class QobuzDownloadService : BaseDownloadService
         request.Headers.Add("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:83.0) Gecko/20100101 Firefox/83.0");
         request.Headers.Add("X-App-Id", appId);
         
-        if (!string.IsNullOrEmpty(_userAuthToken))
+        var userAuthToken = CurrentUserAuthToken;
+        if (!string.IsNullOrEmpty(userAuthToken))
         {
-            request.Headers.Add("X-User-Auth-Token", _userAuthToken);
+            request.Headers.Add("X-User-Auth-Token", userAuthToken);
         }
         
         var response = await _httpClient.SendAsync(request, cancellationToken);
@@ -207,6 +212,11 @@ public class QobuzDownloadService : BaseDownloadService
         
         if (!response.IsSuccessStatusCode)
         {
+            if (response.StatusCode == System.Net.HttpStatusCode.Unauthorized)
+            {
+                _bundleService.ReportAuthFailure();
+            }
+
             Logger.LogDebug("Qobuz getFileUrl failed - Status: {StatusCode}, TrackId: {TrackId}, FormatId: {FormatId}", 
                 response.StatusCode, trackId, formatId);
             throw new HttpRequestException($"Response status code does not indicate success: {response.StatusCode} ({response.ReasonPhrase})");

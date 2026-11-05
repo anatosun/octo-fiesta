@@ -21,25 +21,27 @@ public class QobuzStartupValidator : BaseStartupValidator
 
     public override async Task<ValidationResult> ValidateAsync(CancellationToken cancellationToken)
     {
-        var userAuthToken = _qobuzSettings.Value.UserAuthToken;
-        var userId = _qobuzSettings.Value.UserId;
+        // A token stored by the OAuth login takes precedence over the configured one.
+        var stored = new QobuzTokenStore(_qobuzSettings.Value.TokenStore).Load();
+        var userAuthToken = stored?.UserAuthToken ?? _qobuzSettings.Value.UserAuthToken;
+        var userId = stored?.UserId ?? _qobuzSettings.Value.UserId;
         var quality = _qobuzSettings.Value.Quality;
 
         if (string.IsNullOrWhiteSpace(userAuthToken))
         {
             WriteStatus("Qobuz UserAuthToken", "NOT CONFIGURED", ConsoleColor.Red);
-            WriteDetail("Set the Qobuz__UserAuthToken environment variable");
+            WriteDetail("Log in at /qobuz/oauth/login, or set the Qobuz__UserAuthToken environment variable");
             return ValidationResult.NotConfigured("Qobuz UserAuthToken not configured");
         }
 
         if (string.IsNullOrWhiteSpace(userId))
         {
             WriteStatus("Qobuz UserId", "NOT CONFIGURED", ConsoleColor.Red);
-            WriteDetail("Set the Qobuz__UserId environment variable");
+            WriteDetail("Log in at /qobuz/oauth/login, or set the Qobuz__UserId environment variable");
             return ValidationResult.NotConfigured("Qobuz UserId not configured");
         }
 
-        WriteStatus("Qobuz UserAuthToken", MaskSecret(userAuthToken), ConsoleColor.Cyan);
+        WriteStatus("Qobuz UserAuthToken", MaskSecret(userAuthToken) + (stored != null ? " (OAuth login)" : ""), ConsoleColor.Cyan);
         WriteStatus("Qobuz UserId", userId, ConsoleColor.Cyan);
         WriteStatus("Qobuz Quality", quality ?? "auto (highest available)", ConsoleColor.Cyan);
 
@@ -86,7 +88,7 @@ public class QobuzStartupValidator : BaseStartupValidator
                 if (response.StatusCode == System.Net.HttpStatusCode.Unauthorized)
                 {
                     WriteStatus(fieldName, "INVALID", ConsoleColor.Red);
-                    WriteDetail("Token is expired or invalid");
+                    WriteDetail("Token is expired or invalid. Log in again at /qobuz/oauth/login");
                 }
                 else
                 {

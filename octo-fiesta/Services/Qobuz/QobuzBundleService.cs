@@ -1,3 +1,4 @@
+using System.Text.Json;
 using System.Text.RegularExpressions;
 using Microsoft.Extensions.Options;
 using octo_fiesta.Models.Settings;
@@ -27,6 +28,21 @@ public class QobuzBundleService
         @"production:\{api:\{appId:""(?<app_id>\d{9})"",appSecret:""\w{32}""",
         RegexOptions.Compiled);
     
+    private static readonly Regex PrivateKeyRegex = new(
+        @"privateKey:\s*""(?<key>[A-Za-z0-9]{6,30})""",
+        RegexOptions.Compiled);
+
+    private const string ApiBaseUrl = "https://www.qobuz.com/api.json/0.2/";
+    private static readonly TimeSpan PendingLoginLifetime = TimeSpan.FromMinutes(10);
+
+    private readonly QobuzTokenStore _tokenStore;
+    private QobuzCredentials? _cachedCredentials;
+    private bool _credentialsLoaded;
+    private readonly object _credentialsLock = new();
+    private DateTimeOffset _pendingLoginUntil = DateTimeOffset.MinValue;
+    private DateTimeOffset _lastAuthWarning = DateTimeOffset.MinValue;
+    private string? _cachedPrivateKey;
+
     // Cached values (valid for the lifetime of the application)
     private string? _cachedAppId;
     private List<string>? _cachedSecrets;
@@ -40,7 +56,157 @@ public class QobuzBundleService
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:83.0) Gecko/20100101 Firefox/83.0");
         _logger = logger;
         _settings = qobuzSettings.Value;
+        _tokenStore = new QobuzTokenStore(_settings.TokenStore);
     }
+
+    #region Credentials / OAuth
+
+    /// <summary>Path of the file the OAuth credentials are persisted to.</summary>
+    public virtual string TokenStorePath => _tokenStore.Path;
+
+    /// <summary>
+    /// Returns the credentials to use for API calls: the OAuth login stored on disk if there is
+    /// one, otherwise the user_auth_token / user_id from configuration. Null when neither exists.
+    /// </summary>
+    public virtual QobuzCredentials? GetCredentials()
+    {
+        lock (_credentialsLock)
+        {
+            if (!_credentialsLoaded)
+            {
+                _cachedCredentials = _tokenStore.Load();
+                _credentialsLoaded = true;
+            }
+
+            if (_cachedCredentials != null) return _cachedCredentials;
+        }
+
+        if (!string.IsNullOrWhiteSpace(_settings.UserAuthToken) && !string.IsNullOrWhiteSpace(_settings.UserId))
+        {
+            return new QobuzCredentials { UserAuthToken = _settings.UserAuthToken, UserId = _settings.UserId };
+        }
+
+        return null;
+    }
+
+    /// <summary>Marks a login as started; the callback is only accepted for a short time after.</summary>
+    public virtual void BeginOAuthLogin()
+    {
+        _pendingLoginUntil = DateTimeOffset.UtcNow + PendingLoginLifetime;
+    }
+
+    /// <summary>True (once) if a login was started recently; consumes the pending login.</summary>
+    public virtual bool TryConsumePendingLogin()
+    {
+        var pending = DateTimeOffset.UtcNow <= _pendingLoginUntil;
+        _pendingLoginUntil = DateTimeOffset.MinValue;
+        return pending;
+    }
+
+    /// <summary>
+    /// Logs a rate-limited hint when Qobuz rejects the stored token, which is the cue to log in again.
+    /// </summary>
+    public virtual void ReportAuthFailure()
+    {
+        var now = DateTimeOffset.UtcNow;
+        if (now - _lastAuthWarning < TimeSpan.FromMinutes(5)) return;
+        _lastAuthWarning = now;
+        _logger.LogWarning(
+            "Qobuz rejected the user auth token (expired or revoked). " +
+            "Log in again at /qobuz/oauth/login to renew it");
+    }
+
+    /// <summary>
+    /// Gets the private key used by the OAuth code exchange (configured, or extracted from the web bundle).
+    /// </summary>
+    public virtual async Task<string> GetPrivateKeyAsync()
+    {
+        if (!string.IsNullOrWhiteSpace(_settings.PrivateKey)) return _settings.PrivateKey;
+        if (_cachedPrivateKey != null) return _cachedPrivateKey;
+
+        var bundleJs = await DownloadBundleAsync(await GetBundleUrlAsync());
+        var match = PrivateKeyRegex.Match(bundleJs);
+        if (!match.Success)
+        {
+            throw new Exception("Could not extract the OAuth private key from the Qobuz bundle; set Qobuz__PrivateKey");
+        }
+
+        _cachedPrivateKey = match.Groups["key"].Value;
+        return _cachedPrivateKey;
+    }
+
+    /// <summary>
+    /// URL the user opens to authenticate with Qobuz; Qobuz redirects back to
+    /// <paramref name="redirectUrl"/> with a code_autorisation query parameter.
+    /// </summary>
+    public virtual async Task<string> BuildOAuthUrlAsync(string redirectUrl)
+    {
+        var appId = await GetAppIdAsync();
+        return $"https://www.qobuz.com/signin/oauth?ext_app_id={Uri.EscapeDataString(appId)}" +
+               $"&redirect_url={Uri.EscapeDataString(redirectUrl)}";
+    }
+
+    /// <summary>
+    /// Exchanges an authorization code for a user auth token, checks it against the API and
+    /// persists it. Throws when the exchange or the check fails, leaving stored credentials untouched.
+    /// </summary>
+    public virtual async Task<QobuzCredentials> ExchangeOAuthCodeAsync(string code, CancellationToken cancellationToken = default)
+    {
+        var appId = await GetAppIdAsync();
+        var privateKey = await GetPrivateKeyAsync();
+
+        var exchangeUrl = $"{ApiBaseUrl}oauth/callback?code={Uri.EscapeDataString(code)}" +
+                          $"&private_key={Uri.EscapeDataString(privateKey)}&app_id={Uri.EscapeDataString(appId)}";
+        using var exchange = await _httpClient.GetAsync(exchangeUrl, cancellationToken);
+        var body = await exchange.Content.ReadAsStringAsync(cancellationToken);
+        if (!exchange.IsSuccessStatusCode)
+        {
+            throw new Exception($"Qobuz rejected the authorization code (HTTP {(int)exchange.StatusCode})");
+        }
+
+        string? token, userId;
+        using (var doc = JsonDocument.Parse(body))
+        {
+            token = doc.RootElement.TryGetProperty("token", out var t) ? t.GetString() : null;
+            userId = doc.RootElement.TryGetProperty("user_id", out var u)
+                ? (u.ValueKind == JsonValueKind.Number ? u.GetInt64().ToString() : u.GetString())
+                : null;
+        }
+
+        if (string.IsNullOrEmpty(token) || string.IsNullOrEmpty(userId))
+        {
+            throw new Exception("Qobuz response did not contain a token and user id");
+        }
+
+        // Make sure the token actually works before replacing whatever is stored.
+        using var check = new HttpRequestMessage(HttpMethod.Get,
+            $"{ApiBaseUrl}favorite/getUserFavorites?user_id={Uri.EscapeDataString(userId)}&app_id={Uri.EscapeDataString(appId)}");
+        check.Headers.Add("X-App-Id", appId);
+        check.Headers.Add("X-User-Auth-Token", token);
+        using var checkResponse = await _httpClient.SendAsync(check, cancellationToken);
+        if (!checkResponse.IsSuccessStatusCode)
+        {
+            throw new Exception($"The new token was rejected by Qobuz (HTTP {(int)checkResponse.StatusCode})");
+        }
+
+        var credentials = new QobuzCredentials
+        {
+            UserAuthToken = token,
+            UserId = userId,
+            ObtainedAt = DateTimeOffset.UtcNow
+        };
+        _tokenStore.Save(credentials);
+        lock (_credentialsLock)
+        {
+            _cachedCredentials = credentials;
+            _credentialsLoaded = true;
+        }
+
+        _logger.LogInformation("Qobuz OAuth login stored for user {UserId} at {Path}", userId, _tokenStore.Path);
+        return credentials;
+    }
+
+    #endregion
 
     /// <summary>
     /// Gets the Qobuz App ID, extracting it from the bundle if not cached

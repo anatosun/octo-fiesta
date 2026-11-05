@@ -111,5 +111,6 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
             VERSION=${{ steps.version.outputs.VERSION }}
+            QOBUZ_OAUTH_REDIRECT_URL=https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/qobuz-oauth/
           cache-from: type=gha
           cache-to: type=gha,mode=max

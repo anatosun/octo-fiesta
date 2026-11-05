@@ -75,7 +75,8 @@ See the [Configuration](https://github.com/V1ck3s/octo-fiesta/wiki/Configuration
 ### Getting Credentials
 
 - [Getting Deezer Credentials (ARL Token)](https://github.com/V1ck3s/octo-fiesta/wiki/Getting-Deezer-Credentials-(ARL-Token))
-- [Getting Qobuz Credentials (User ID & Token)](https://github.com/V1ck3s/octo-fiesta/wiki/Getting-Qobuz-Credentials-(User-ID-&-Token))
+- **Qobuz** (recommended): open `http://<octo-fiesta>/qobuz/oauth/login` once in a browser and sign in to Qobuz. The token is stored in `Qobuz__TokenStore` (default `/config/qobuz-token.json` in Docker, so keep `/config` on a volume) and takes precedence over `Qobuz__UserAuthToken` / `Qobuz__UserId`. Official images are built with `Qobuz__OAuthRedirectUrl` pointing at the GitHub Pages relay in `docs/qobuz-oauth/` (published from `master`): after you sign in, it asks for your server address once (remembered in the browser) and forwards the code to `<server>/qobuz/oauth/callback`. Set `Qobuz__OAuthRedirectUrl` to an empty value to use your server's own `/qobuz/oauth/callback` directly, or to another URL to host the relay yourself. If the token is ever rejected, the log tells you to log in again.
+- [Getting Qobuz Credentials manually (User ID & Token)](https://github.com/V1ck3s/octo-fiesta/wiki/Getting-Qobuz-Credentials-(User-ID-&-Token))
 - [Getting Tidal Credentials (OAuth Tokens)](https://github.com/V1ck3s/octo-fiesta/wiki/Getting-Tidal-Credentials-(OAuth-Tokens))
 - **SquidWTF** (deprecated): No credentials needed
 - **Yandex**: credentials may be obtained by authorizing official Yandex Music OAuth client [here](https://oauth.yandex.ru/authorize?response_type=token&client_id=23cabbbdc6cd418abb4b39c32c41195d). After authorization OAuth token will appear in the address bar in `#access_token=` fragment
