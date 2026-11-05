@@ -103,7 +103,7 @@ public class QobuzStartupValidator : BaseStartupValidator
                 {
                     WriteStatus(fieldName, $"HTTP {(int)response.StatusCode}", ConsoleColor.Yellow);
                     WriteDetail("Unable to verify credentials (app ID " + appId + ")");
-                    var errorBody = await response.Content.ReadAsStringAsync(cancellationToken);
+                    var errorBody = await response.Content.ReadDecodedStringAsync(cancellationToken);
                     if (errorBody.Length > 200) errorBody = errorBody[..200];
                     if (!string.IsNullOrWhiteSpace(errorBody)) WriteDetail("Qobuz said: " + errorBody);
                 }
