@@ -193,7 +193,7 @@ public class QobuzBundleService
         {
             // The code exchange succeeded, so keep the token; this endpoint may simply not accept it
             // (e.g. extra signing requirements). Real requests will log a hint if it is actually bad.
-            var checkBody = await checkResponse.Content.ReadAsStringAsync(cancellationToken);
+            var checkBody = await checkResponse.Content.ReadDecodedStringAsync(cancellationToken);
             if (checkBody.Length > 300) checkBody = checkBody[..300];
             _logger.LogWarning(
                 "Qobuz token check returned HTTP {Status} for user {UserId}; storing the token anyway. Response: {Body}",

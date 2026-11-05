@@ -201,4 +201,36 @@ public class QobuzOAuthTests : IDisposable
         Assert.False(creds.Persisted);
         Assert.Equal("new", svc.GetCredentials()!.UserAuthToken);
     }
+
+    [Fact]
+    public void Decode_Gzip_ReturnsText()
+    {
+        var raw = System.Text.Encoding.UTF8.GetBytes("{\"message\":\"nope\"}");
+        using var ms = new MemoryStream();
+        using (var gz = new System.IO.Compression.GZipStream(ms, System.IO.Compression.CompressionLevel.Optimal, true))
+        {
+            gz.Write(raw, 0, raw.Length);
+        }
+
+        Assert.Equal("{\"message\":\"nope\"}", QobuzHttpExtensions.Decode(ms.ToArray(), "gzip"));
+    }
+
+    [Fact]
+    public void Decode_RawDeflate_ReturnsText()
+    {
+        var raw = System.Text.Encoding.UTF8.GetBytes("{\"message\":\"nope\"}");
+        using var ms = new MemoryStream();
+        using (var d = new System.IO.Compression.DeflateStream(ms, System.IO.Compression.CompressionLevel.Optimal, true))
+        {
+            d.Write(raw, 0, raw.Length);
+        }
+
+        Assert.Equal("{\"message\":\"nope\"}", QobuzHttpExtensions.Decode(ms.ToArray(), "deflate"));
+    }
+
+    [Fact]
+    public void Decode_PlainText_IsReturnedUnchanged()
+    {
+        Assert.Equal("{}", QobuzHttpExtensions.Decode(System.Text.Encoding.UTF8.GetBytes("{}"), null));
+    }
 }
