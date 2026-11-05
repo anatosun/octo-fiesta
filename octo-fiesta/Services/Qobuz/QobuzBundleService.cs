@@ -184,9 +184,20 @@ public class QobuzBundleService
         check.Headers.Add("X-App-Id", appId);
         check.Headers.Add("X-User-Auth-Token", token);
         using var checkResponse = await _httpClient.SendAsync(check, cancellationToken);
+        if (checkResponse.StatusCode == System.Net.HttpStatusCode.Unauthorized)
+        {
+            throw new Exception("The new token was rejected by Qobuz (HTTP 401)");
+        }
+
         if (!checkResponse.IsSuccessStatusCode)
         {
-            throw new Exception($"The new token was rejected by Qobuz (HTTP {(int)checkResponse.StatusCode})");
+            // The code exchange succeeded, so keep the token; this endpoint may simply not accept it
+            // (e.g. extra signing requirements). Real requests will log a hint if it is actually bad.
+            var checkBody = await checkResponse.Content.ReadAsStringAsync(cancellationToken);
+            if (checkBody.Length > 300) checkBody = checkBody[..300];
+            _logger.LogWarning(
+                "Qobuz token check returned HTTP {Status} for user {UserId}; storing the token anyway. Response: {Body}",
+                (int)checkResponse.StatusCode, userId, checkBody);
         }
 
         var credentials = new QobuzCredentials
