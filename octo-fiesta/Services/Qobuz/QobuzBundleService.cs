@@ -206,14 +206,29 @@ public class QobuzBundleService
             UserId = userId,
             ObtainedAt = DateTimeOffset.UtcNow
         };
-        _tokenStore.Save(credentials);
+        try
+        {
+            _tokenStore.Save(credentials);
+        }
+        catch (Exception ex)
+        {
+            // Keep the working token for this run rather than discarding a successful login.
+            credentials.Persisted = false;
+            _logger.LogError(ex,
+                "Could not write the Qobuz token to {Path}; it will be lost on restart. Set Qobuz__TokenStore to a writable path",
+                _tokenStore.Path);
+        }
+
         lock (_credentialsLock)
         {
             _cachedCredentials = credentials;
             _credentialsLoaded = true;
         }
 
-        _logger.LogInformation("Qobuz OAuth login stored for user {UserId} at {Path}", userId, _tokenStore.Path);
+        if (credentials.Persisted)
+        {
+            _logger.LogInformation("Qobuz OAuth login stored for user {UserId} at {Path}", userId, _tokenStore.Path);
+        }
         return credentials;
     }
 
