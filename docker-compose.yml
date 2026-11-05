@@ -58,6 +58,8 @@ services:
       - Qobuz__UserAuthToken=${QOBUZ_USER_AUTH_TOKEN:-}
       # Qobuz user ID (required if using Qobuz)
       - Qobuz__UserId=${QOBUZ_USER_ID:-}
+      # Where the token from the OAuth login (/qobuz/oauth/login) is stored; takes precedence over the two above
+      - Qobuz__TokenStore=${QOBUZ_TOKEN_STORE:-/config/qobuz-token.json}
       # Preferred audio quality: FLAC, FLAC_24_HIGH, FLAC_24_LOW, FLAC_16, MP3_320 (optional)
       - Qobuz__Quality=${QOBUZ_QUALITY:-}
       - Qobuz__DownloadPath=${QOBUZ_DOWNLOAD_PATH:-}

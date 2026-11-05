@@ -19,6 +19,12 @@ RUN dotnet publish octo-fiesta/octo-fiesta.csproj -c Release -p:Version=$VERSION
 FROM mcr.microsoft.com/dotnet/aspnet:9.0
 WORKDIR /app
 
+# Callback page Qobuz redirects to after the OAuth login (GitHub Pages relay from docs/qobuz-oauth).
+# Empty means the server's own /qobuz/oauth/callback is used. Override at runtime with
+# Qobuz__OAuthRedirectUrl.
+ARG QOBUZ_OAUTH_REDIRECT_URL=""
+ENV Qobuz__OAuthRedirectUrl=$QOBUZ_OAUTH_REDIRECT_URL
+
 RUN mkdir -p /app/downloads
 
 COPY --from=build /app/publish .

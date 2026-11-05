@@ -575,12 +575,19 @@ public class QobuzMetadataService : IMusicMetadataService
         var appId = await _bundleService.GetAppIdAsync();
         request.Headers.Add("X-App-Id", appId);
         
-        if (!string.IsNullOrEmpty(_userAuthToken))
+        var userAuthToken = _bundleService.GetCredentials()?.UserAuthToken ?? _userAuthToken;
+        if (!string.IsNullOrEmpty(userAuthToken))
         {
-            request.Headers.Add("X-User-Auth-Token", _userAuthToken);
+            request.Headers.Add("X-User-Auth-Token", userAuthToken);
         }
         
-        return await _httpClient.SendAsync(request);
+        var response = await _httpClient.SendAsync(request);
+        if (response.StatusCode == System.Net.HttpStatusCode.Unauthorized)
+        {
+            _bundleService.ReportAuthFailure();
+        }
+
+        return response;
     }
 
     private Song ParseQobuzTrack(JsonElement track)
