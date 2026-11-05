@@ -10,13 +10,17 @@ namespace octo_fiesta.Services.Qobuz;
 public class QobuzStartupValidator : BaseStartupValidator
 {
     private readonly IOptions<QobuzSettings> _qobuzSettings;
+    private readonly QobuzBundleService? _bundleService;
 
     public override string ServiceName => "Qobuz";
 
-    public QobuzStartupValidator(IOptions<QobuzSettings> qobuzSettings, HttpClient httpClient)
+    // The bundle service is only registered when Qobuz is a provider, so it is optional here.
+    public QobuzStartupValidator(IOptions<QobuzSettings> qobuzSettings, HttpClient httpClient,
+        QobuzBundleService? bundleService = null)
         : base(httpClient)
     {
         _qobuzSettings = qobuzSettings;
+        _bundleService = bundleService;
     }
 
     public override async Task<ValidationResult> ValidateAsync(CancellationToken cancellationToken)
@@ -71,7 +75,12 @@ public class QobuzStartupValidator : BaseStartupValidator
             // Try to validate with a simple API call
             // We'll use the user favorites endpoint which requires authentication.
             // Honour a configured App ID so tokens issued by a non-web-player app validate.
+            // Use the same app ID the services use: a token only works with the app ID that issued it.
             var appId = _qobuzSettings.Value.AppId;
+            if (string.IsNullOrWhiteSpace(appId) && _bundleService != null)
+            {
+                try { appId = await _bundleService.GetAppIdAsync(); } catch { /* fall through to the default */ }
+            }
             if (string.IsNullOrWhiteSpace(appId)) appId = "798273057"; // Fallback app ID
             var apiUrl = $"https://www.qobuz.com/api.json/0.2/favorite/getUserFavorites?user_id={userId}&app_id={appId}";
             
@@ -93,7 +102,10 @@ public class QobuzStartupValidator : BaseStartupValidator
                 else
                 {
                     WriteStatus(fieldName, $"HTTP {(int)response.StatusCode}", ConsoleColor.Yellow);
-                    WriteDetail("Unable to verify credentials");
+                    WriteDetail("Unable to verify credentials (app ID " + appId + ")");
+                    var errorBody = await response.Content.ReadAsStringAsync(cancellationToken);
+                    if (errorBody.Length > 200) errorBody = errorBody[..200];
+                    if (!string.IsNullOrWhiteSpace(errorBody)) WriteDetail("Qobuz said: " + errorBody);
                 }
                 return;
             }
