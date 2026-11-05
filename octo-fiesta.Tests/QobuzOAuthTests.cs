@@ -23,7 +23,7 @@ public class QobuzOAuthTests : IDisposable
     private string StorePath => Path.Combine(_dir, "qobuz-token.json");
 
     private QobuzBundleService CreateService(QobuzSettings settings, HttpStatusCode exchangeStatus,
-        string exchangeBody, HttpStatusCode checkStatus)
+        string exchangeBody, HttpStatusCode checkStatus, string? storePath = null)
     {
         var handler = new Mock<HttpMessageHandler>();
         handler.Protected()
@@ -44,7 +44,7 @@ public class QobuzOAuthTests : IDisposable
         settings.AppId ??= "123456789";
         settings.AppSecret ??= "secret";
         settings.PrivateKey ??= "privkey";
-        settings.TokenStore = StorePath;
+        settings.TokenStore = storePath ?? StorePath;
         return new QobuzBundleService(factory.Object, Mock.Of<ILogger<QobuzBundleService>>(), Options.Create(settings));
     }
 
@@ -184,5 +184,21 @@ public class QobuzOAuthTests : IDisposable
 
         Assert.StartsWith("https://www.qobuz.com/signin/oauth?ext_app_id=123456789&redirect_url=", url);
         Assert.Contains(Uri.EscapeDataString("http://host:5000/qobuz/oauth/callback"), url);
+    }
+
+    [Fact]
+    public async Task ExchangeOAuthCode_StoreNotWritable_KeepsTokenInMemory()
+    {
+        // A regular file where a directory is needed makes saving fail.
+        var blocker = Path.Combine(_dir, "blocker");
+        File.WriteAllText(blocker, "x");
+        var svc = CreateService(new QobuzSettings(), HttpStatusCode.OK,
+            "{\"token\":\"new\",\"user_id\":\"2\"}", HttpStatusCode.OK,
+            Path.Combine(blocker, "qobuz-token.json"));
+
+        var creds = await svc.ExchangeOAuthCodeAsync("c");
+
+        Assert.False(creds.Persisted);
+        Assert.Equal("new", svc.GetCredentials()!.UserAuthToken);
     }
 }

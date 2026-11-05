@@ -11,6 +11,10 @@ public class QobuzCredentials
     public string UserAuthToken { get; set; } = string.Empty;
     public string UserId { get; set; } = string.Empty;
     public DateTimeOffset ObtainedAt { get; set; } = DateTimeOffset.UtcNow;
+
+    /// <summary>False when the token could not be written to disk and only lives in memory.</summary>
+    [System.Text.Json.Serialization.JsonIgnore]
+    public bool Persisted { get; set; } = true;
 }
 
 /// <summary>

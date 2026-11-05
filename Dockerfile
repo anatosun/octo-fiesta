@@ -25,7 +25,10 @@ WORKDIR /app
 ARG QOBUZ_OAUTH_REDIRECT_URL=""
 ENV Qobuz__OAuthRedirectUrl=$QOBUZ_OAUTH_REDIRECT_URL
 
-RUN mkdir -p /app/downloads
+RUN mkdir -p /app/downloads /config && chmod 777 /config
+
+# Where the Qobuz OAuth token is persisted; mount a volume on /config to keep it across recreations.
+ENV Qobuz__TokenStore=/config/qobuz-token.json
 
 COPY --from=build /app/publish .
 

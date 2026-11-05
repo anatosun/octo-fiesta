@@ -70,6 +70,13 @@ public class QobuzOAuthController : ControllerBase
         try
         {
             var credentials = await _bundleService.ExchangeOAuthCodeAsync(authCode, cancellationToken);
+            if (!credentials.Persisted)
+            {
+                return Page(StatusCodes.Status200OK, "Qobuz login successful, but not saved",
+                    $"Logged in as user {credentials.UserId}, but the token could not be written to {_bundleService.TokenStorePath} " +
+                    "and will be lost when octo-fiesta restarts. Set Qobuz__TokenStore to a writable path (for Docker, a volume mounted on /config) and log in again.");
+            }
+
             return Page(StatusCodes.Status200OK, "Qobuz login successful",
                 $"Logged in as user {credentials.UserId}. The token is stored in {_bundleService.TokenStorePath}. You can close this tab.");
         }
