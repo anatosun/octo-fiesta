@@ -25,7 +25,10 @@ public class QobuzDownloadService : BaseDownloadService
     private readonly string? _userAuthToken;
     private readonly string? _userId;
     private readonly string? _preferredQuality;
-    
+
+    // Index of the bundle secret Qobuz last accepted, tried first on the next track
+    private volatile int _workingSecretIndex = -1;
+
     private const string BaseUrl = "https://www.qobuz.com/api.json/0.2/";
     
     // Quality format IDs
@@ -142,54 +145,78 @@ public class QobuzDownloadService : BaseDownloadService
     /// <summary>
     /// Gets the download URL for a track with proper MD5 signature
     /// </summary>
+    /// <remarks>
+    /// Keeps the number of getFileUrl calls low: the secret that signed the last request is tried
+    /// first (so usually one call per track), a rejected login ends the attempt at once, and only
+    /// the configured quality and those below it are asked for. Qobuz already downgrades a format
+    /// a track lacks, so a lower format is only asked for when the preferred one errors.
+    /// </remarks>
     private async Task<QobuzDownloadResult> GetTrackDownloadUrlAsync(string trackId, CancellationToken cancellationToken)
     {
-        var appId = await _bundleService.GetAppIdAsync();
         var secrets = await _bundleService.GetSecretsAsync();
-        
+
         if (secrets.Count == 0)
         {
             throw new Exception("No secrets available for signing");
         }
-        
-        // Determine format ID based on preferred quality
-        var formatId = GetFormatId(_preferredQuality);
-        
-        // Try the preferred quality first, then fallback to lower qualities
-        var formatPriority = GetFormatPriority(formatId);
-        
+
+        var formats = GetFormatPriority(GetFormatId(_preferredQuality));
+        var workingSecret = _workingSecretIndex;
+        var secretOrder = Enumerable.Range(0, secrets.Count)
+            .OrderBy(i => i == workingSecret ? 0 : 1)
+            .ToList();
+
         Exception? lastException = null;
-        
-        // Try each secret with each format
-        foreach (var secret in secrets)
+
+        foreach (var secretIndex in secretOrder)
         {
-            var secretIndex = secrets.IndexOf(secret);
-            foreach (var format in formatPriority)
+            foreach (var format in formats)
             {
                 try
                 {
-                    var result = await TryGetTrackDownloadUrlAsync(trackId, format, secret, cancellationToken);
-                    
-                    // Check if quality was downgraded
+                    var result = await TryGetTrackDownloadUrlAsync(trackId, format, secrets[secretIndex], cancellationToken);
+                    _workingSecretIndex = secretIndex;
+
                     if (result.WasQualityDowngraded)
                     {
                         Logger.LogWarning("Requested quality not available, Qobuz downgraded to {BitDepth}bit/{SamplingRate}kHz",
                             result.BitDepth, result.SamplingRate);
                     }
-                    
+
                     return result;
                 }
-                catch (Exception ex)
+                catch (QobuzAuthException)
+                {
+                    // Another secret or format cannot fix a rejected login
+                    throw;
+                }
+                catch (QobuzSignatureException ex)
                 {
                     lastException = ex;
-                    Logger.LogDebug("Failed to get download URL with secret {SecretIndex}, format {Format}: {Error}", 
+                    Logger.LogDebug("Secret {SecretIndex} rejected by Qobuz, trying the next one", secretIndex);
+                    break;
+                }
+                catch (Exception ex) when (ex is not OperationCanceledException)
+                {
+                    lastException = ex;
+                    Logger.LogDebug("Failed to get download URL with secret {SecretIndex}, format {Format}: {Error}",
                         secretIndex, format, ex.Message);
                 }
             }
+
+            // This secret was accepted, so the other ones would fail on the same track
+            if (secretIndex == workingSecret && lastException is not QobuzSignatureException)
+            {
+                break;
+            }
         }
-        
-        throw new Exception($"Failed to get download URL for all secrets and quality formats", lastException);
+
+        throw new Exception($"Failed to get download URL for track {trackId}", lastException);
     }
+
+    private sealed class QobuzAuthException(string message) : HttpRequestException(message);
+
+    private sealed class QobuzSignatureException(string message) : HttpRequestException(message);
 
     private async Task<QobuzDownloadResult> TryGetTrackDownloadUrlAsync(string trackId, int formatId, string secret, CancellationToken cancellationToken)
     {
@@ -215,14 +242,22 @@ public class QobuzDownloadService : BaseDownloadService
         
         if (!response.IsSuccessStatusCode)
         {
+            Logger.LogDebug("Qobuz getFileUrl failed - Status: {StatusCode}, TrackId: {TrackId}, FormatId: {FormatId}",
+                response.StatusCode, trackId, formatId);
+
+            var failure = $"Response status code does not indicate success: {response.StatusCode} ({response.ReasonPhrase})";
             if (response.StatusCode == System.Net.HttpStatusCode.Unauthorized)
             {
                 _bundleService.ReportAuthFailure();
+                throw new QobuzAuthException(failure);
             }
-
-            Logger.LogDebug("Qobuz getFileUrl failed - Status: {StatusCode}, TrackId: {TrackId}, FormatId: {FormatId}", 
-                response.StatusCode, trackId, formatId);
-            throw new HttpRequestException($"Response status code does not indicate success: {response.StatusCode} ({response.ReasonPhrase})");
+            // "Invalid Request Signature parameter (request_sig)": signed with the wrong secret
+            if (response.StatusCode == System.Net.HttpStatusCode.BadRequest
+                && responseBody.Contains("request_sig", StringComparison.OrdinalIgnoreCase))
+            {
+                throw new QobuzSignatureException(failure);
+            }
+            throw new HttpRequestException(failure);
         }
         
         var doc = JsonDocument.Parse(responseBody);
@@ -308,16 +343,13 @@ public class QobuzDownloadService : BaseDownloadService
     }
 
     /// <summary>
-    /// Gets the list of format IDs to try in priority order
+    /// The preferred format followed by the lower ones, best first. Never above the preference.
     /// </summary>
-    private List<int> GetFormatPriority(int preferredFormat)
+    internal static List<int> GetFormatPriority(int preferredFormat)
     {
         var allFormats = new List<int> { FormatFlac24High, FormatFlac24Low, FormatFlac16, FormatMp3320 };
-        
-        var priority = new List<int> { preferredFormat };
-        priority.AddRange(allFormats.Where(f => f != preferredFormat));
-        
-        return priority;
+        var start = allFormats.IndexOf(preferredFormat);
+        return allFormats.Skip(Math.Max(start, 0)).ToList();
     }
 
     #endregion
