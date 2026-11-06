@@ -1120,10 +1120,10 @@ public class SubsonicController : ControllerBase
             }
         }
 
-        int? size = int.TryParse(parameters.GetValueOrDefault("size"), out var requestedSize) ? requestedSize : null;
+        // The display-size image whatever size is asked for; the large one is for downloads
         try
         {
-            var cover = await _coverArt.GetAsync(coverProvider!, type ?? "song", coverExternalId!, size);
+            var cover = await _coverArt.GetAsync(coverProvider!, type ?? "song", coverExternalId!);
             return cover == null ? NotFound() : CoverResult(cover);
         }
         catch (Exception ex)

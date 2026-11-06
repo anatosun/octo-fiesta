@@ -14,23 +14,16 @@ public class ExternalCoverArtServiceTests
     private const string Original = "https://static.qobuz.com/images/covers/ab/cd/abc_org.jpg";
 
     [Theory]
-    [InlineData(null, Small)]       // no size: what a now-playing screen shows, not the original
-    [InlineData(600, Small)]
-    [InlineData(150, Small)]
-    [InlineData(1200, Original)]    // asked for more: the full image
-    public void PickUrl_SendsTheOriginalOnlyWhenAskedForMore(int? size, string expected)
+    [InlineData("song")]
+    [InlineData("album")]
+    public async Task GetAsync_NeverSendsTheLargeImage(string type)
     {
-        Assert.Equal(expected, ExternalCoverArtService.PickUrl(Small, Original, size));
-    }
+        var (service, images, _) = CreateService();
 
-    [Fact]
-    public void PickUrl_KeepsALargeImageThatIsNotAnOriginal()
-    {
-        const string medium = "https://e-cdns-images.dzcdn.net/images/cover/x/250x250-000000-80-0-0.jpg";
-        const string xl = "https://e-cdns-images.dzcdn.net/images/cover/x/1000x1000-000000-80-0-0.jpg";
+        Assert.NotNull(await service.GetAsync("qobuz", type, "1"));
 
-        Assert.Equal(xl, ExternalCoverArtService.PickUrl(medium, xl, null));
-        Assert.Equal(medium, ExternalCoverArtService.PickUrl(medium, xl, 100));
+        // The original is only fetched by downloads, to embed in the file
+        Assert.Equal(new[] { Small }, images.Requests);
     }
 
     [Fact]
@@ -38,8 +31,8 @@ public class ExternalCoverArtServiceTests
     {
         var (service, images, metadata) = CreateService();
 
-        var first = await service.GetAsync("qobuz", "song", "1", size: null);
-        var second = await service.GetAsync("qobuz", "song", "1", size: null);
+        var first = await service.GetAsync("qobuz", "song", "1");
+        var second = await service.GetAsync("qobuz", "song", "1");
 
         Assert.NotNull(first);
         Assert.Same(first, second);
@@ -52,7 +45,7 @@ public class ExternalCoverArtServiceTests
     {
         var (service, images, _) = CreateService(delay: TimeSpan.FromMilliseconds(200));
 
-        var covers = await Task.WhenAll(Enumerable.Range(0, 5).Select(_ => service.GetAsync("qobuz", "song", "1", size: null)));
+        var covers = await Task.WhenAll(Enumerable.Range(0, 5).Select(_ => service.GetAsync("qobuz", "song", "1")));
 
         Assert.All(covers, Assert.NotNull);
         Assert.Single(images.Requests);
@@ -69,7 +62,7 @@ public class ExternalCoverArtServiceTests
         {
             await Task.Delay(10);
         }
-        await service.GetAsync("qobuz", "song", "1", size: 600);
+        await service.GetAsync("qobuz", "song", "1");
 
         Assert.Single(images.Requests);
     }
@@ -79,8 +72,8 @@ public class ExternalCoverArtServiceTests
     {
         var (service, images, _) = CreateService(status: HttpStatusCode.ServiceUnavailable);
 
-        Assert.Null(await service.GetAsync("qobuz", "song", "1", size: null));
-        Assert.Null(await service.GetAsync("qobuz", "song", "1", size: null));
+        Assert.Null(await service.GetAsync("qobuz", "song", "1"));
+        Assert.Null(await service.GetAsync("qobuz", "song", "1"));
 
         Assert.Equal(2, images.Requests.Count);
     }
@@ -96,6 +89,9 @@ public class ExternalCoverArtServiceTests
         metadata
             .Setup(m => m.GetSongAsync("qobuz", It.IsAny<string>()))
             .ReturnsAsync((string _, string id) => new Song { ExternalId = id, CoverArtUrl = Small, CoverArtUrlLarge = Original });
+        metadata
+            .Setup(m => m.GetAlbumAsync("qobuz", It.IsAny<string>()))
+            .ReturnsAsync((string _, string id) => new Album { Id = id, CoverArtUrl = Small, CoverArtUrlLarge = Original });
 
         var service = new ExternalCoverArtService(metadata.Object, NullLogger<ExternalCoverArtService>.Instance, httpClientFactory.Object);
         return (service, images, metadata);
