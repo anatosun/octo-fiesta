@@ -32,10 +32,10 @@ public class QobuzDownloadService : BaseDownloadService
     private const string BaseUrl = "https://www.qobuz.com/api.json/0.2/";
     
     // Quality format IDs
-    private const int FormatMp3320 = 5;
-    private const int FormatFlac16 = 6;      // CD quality (16-bit 44.1kHz)
-    private const int FormatFlac24Low = 7;   // 24-bit < 96kHz
-    private const int FormatFlac24High = 27; // 24-bit >= 96kHz
+    private const int FormatMp3320 = QobuzQuality.Mp3320;
+    private const int FormatFlac16 = QobuzQuality.Flac16;
+    private const int FormatFlac24Low = QobuzQuality.Flac24Low;
+    private const int FormatFlac24High = QobuzQuality.Flac24High;
 
     protected override string ProviderName => "qobuz";
 
@@ -160,7 +160,7 @@ public class QobuzDownloadService : BaseDownloadService
             throw new Exception("No secrets available for signing");
         }
 
-        var formats = GetFormatPriority(GetFormatId(_preferredQuality));
+        var formats = GetFormatPriority(QobuzQuality.GetFormatId(_preferredQuality));
         var workingSecret = _workingSecretIndex;
         var secretOrder = Enumerable.Range(0, secrets.Count)
             .OrderBy(i => i == workingSecret ? 0 : 1)
@@ -319,27 +319,6 @@ public class QobuzDownloadService : BaseDownloadService
         var signature = BitConverter.ToString(hash).Replace("-", "").ToLowerInvariant();
         
         return signature;
-    }
-
-    /// <summary>
-    /// Gets the format ID based on quality preference
-    /// </summary>
-    private int GetFormatId(string? quality)
-    {
-        if (string.IsNullOrEmpty(quality))
-        {
-            return FormatFlac24High;
-        }
-        
-        return quality.ToUpperInvariant() switch
-        {
-            "FLAC" => FormatFlac24High,
-            "FLAC_24_HIGH" or "24_192" => FormatFlac24High,
-            "FLAC_24_LOW" or "24_96" => FormatFlac24Low,
-            "FLAC_16" or "CD" => FormatFlac16,
-            "MP3_320" or "MP3" => FormatMp3320,
-            _ => FormatFlac24High
-        };
     }
 
     /// <summary>
