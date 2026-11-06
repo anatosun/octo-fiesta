@@ -13,12 +13,19 @@ public sealed class ProgressiveDownload
     private bool _completed;
     private Exception? _error;
 
-    public ProgressiveDownload(string partPath, long length, string targetPath)
+    // Assumed when the duration is unknown: CD-quality FLAC at its uncompressed ceiling
+    private const double FallbackBytesPerSecond = 1411 * 1000 / 8.0;
+
+    public ProgressiveDownload(string partPath, long length, string targetPath, double? durationSeconds = null)
     {
         PartPath = partPath;
         Length = length;
         TargetPath = targetPath;
+        DurationSeconds = durationSeconds is > 0 ? durationSeconds : null;
     }
+
+    /// <summary>Playing time of the track, when known.</summary>
+    public double? DurationSeconds { get; }
 
     /// <summary>Scratch file receiving the raw provider bytes (never tagged in place).</summary>
     public string PartPath { get; }
@@ -73,6 +80,23 @@ public sealed class ProgressiveDownload
             }
             await wait.WaitAsync(cancellationToken);
         }
+    }
+
+    /// <summary>
+    /// Waits until <paramref name="seconds"/> of audio are on disk, or the download ended.
+    /// The byte count comes from the track's average rate (size over duration).
+    /// Throws if the download failed.
+    /// </summary>
+    public Task WaitForSecondsAsync(double seconds, CancellationToken cancellationToken)
+    {
+        if (seconds <= 0)
+        {
+            return Task.CompletedTask;
+        }
+
+        var bytesPerSecond = DurationSeconds is { } duration ? Length / duration : FallbackBytesPerSecond;
+        var bytes = (long)Math.Min(Length, Math.Ceiling(bytesPerSecond * seconds));
+        return bytes <= 0 ? Task.CompletedTask : WaitForDataAsync(bytes - 1, cancellationToken);
     }
 
     /// <summary>

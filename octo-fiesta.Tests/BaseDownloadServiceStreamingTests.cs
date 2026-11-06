@@ -207,6 +207,48 @@ public class BaseDownloadServiceStreamingTests : IDisposable
     }
 
     [Fact]
+    public async Task DownloadAndStreamAsync_WaitsForThePrebufferBeforeServing()
+    {
+        // 100 bytes over 10 seconds: a 2 second head start is 20 bytes
+        var metadata = new Mock<IMusicMetadataService>();
+        metadata
+            .Setup(x => x.GetSongAsync("fake", "1"))
+            .ReturnsAsync(new Song { ExternalId = "1", Title = "Track", Artist = "Artist", Album = "Album", Duration = 10 });
+        var service = CreateService(metadata, prebufferSeconds: 2);
+        var track = service.AddTrack("1", length: 100);
+
+        await track.WriteAsync(FlacHeader);
+        var streamTask = service.DownloadAndStreamAsync("fake", "1");
+        await Task.Delay(100);
+        Assert.False(streamTask.IsCompleted);
+
+        await track.WriteAsync(new byte[4]);
+        var (stream, _) = await streamTask.WaitAsync(Timeout);
+        await stream.DisposeAsync();
+
+        await track.WriteAsync(new byte[80]);
+        await track.CompleteAsync();
+        await WaitForStatusAsync(service, "ext-fake-1", DownloadStatus.Completed);
+    }
+
+    [Fact]
+    public async Task DownloadAndStreamAsync_ShortTrack_IsServedOnceComplete()
+    {
+        // The head start is longer than the whole track
+        var service = CreateService(prebufferSeconds: 30);
+        var track = service.AddTrack("1", length: FlacHeader.Length + 2);
+
+        await track.WriteAsync(FlacHeader);
+        await track.WriteAsync([1, 2]);
+        var (stream, _) = await service.DownloadAndStreamAsync("fake", "1").WaitAsync(Timeout);
+        await using (stream)
+        {
+            Assert.Equal(FlacHeader.Length + 2, stream.Length);
+        }
+        await track.CompleteAsync();
+    }
+
+    [Fact]
     public async Task DownloadAndStreamAsync_AfterAFailedDownload_StartsAFreshOne()
     {
         var service = CreateService();
@@ -256,7 +298,7 @@ public class BaseDownloadServiceStreamingTests : IDisposable
         metadata.Verify(x => x.GetSongAsync(It.IsAny<string>(), It.IsAny<string>()), Times.Never);
     }
 
-    private FakeStreamingDownloadService CreateService(Mock<IMusicMetadataService>? metadataOverride = null)
+    private FakeStreamingDownloadService CreateService(Mock<IMusicMetadataService>? metadataOverride = null, double prebufferSeconds = 0)
     {
         // Behaves like the real library: a registered download is found on the next lookup
         var registered = new ConcurrentDictionary<string, LocalSongMapping>();
@@ -297,7 +339,7 @@ public class BaseDownloadServiceStreamingTests : IDisposable
             config,
             localLibrary.Object,
             metadata.Object,
-            new SubsonicSettings(),
+            new SubsonicSettings { StreamPrebufferSeconds = prebufferSeconds },
             new Mock<IServiceProvider>().Object,
             NullLogger.Instance);
     }

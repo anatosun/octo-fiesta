@@ -168,11 +168,15 @@ public abstract class BaseDownloadService : IDownloadService
         // Playback skips the background queue, and follows the track's download if one is already running
         var download = await StartOrJoinAsync(new DownloadRequest(externalId, TriggerAlbumDownload: true, ForcePermanent: false), cancellationToken);
 
-        if (await download.Readable.WaitAsync(cancellationToken) is { } progressive
-            && progressive.TryOpenReader() is { } reader)
+        if (await download.Readable.WaitAsync(cancellationToken) is { } progressive)
         {
-            Logger.LogInformation("Streaming {SongId} while it downloads", download.SongId);
-            return (reader, progressive.TargetPath);
+            // A head start, so the player does not run dry while the download gets up to speed
+            await progressive.WaitForSecondsAsync(SubsonicSettings.StreamPrebufferSeconds, cancellationToken);
+            if (progressive.TryOpenReader() is { } reader)
+            {
+                Logger.LogInformation("Streaming {SongId} while it downloads", download.SongId);
+                return (reader, progressive.TargetPath);
+            }
         }
 
         var localPath = await download.Completed.WaitAsync(cancellationToken);
@@ -1039,7 +1043,7 @@ public abstract class BaseDownloadService : IDownloadService
         ProgressiveDownload Open()
         {
             var extension = DetectAudioExtension(partPath) ?? Path.GetExtension(outputPath);
-            var opened = new ProgressiveDownload(partPath, length, Path.ChangeExtension(outputPath, extension));
+            var opened = new ProgressiveDownload(partPath, length, Path.ChangeExtension(outputPath, extension), song.Duration);
             onReadable(opened);
             return opened;
         }
