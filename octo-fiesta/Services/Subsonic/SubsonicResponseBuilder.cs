@@ -752,7 +752,15 @@ public class SubsonicResponseBuilder
             return ("mp3", "audio/mpeg", 128);
         }
 
-        // Default for external providers (Deezer, Qobuz, SquidWTF) without cached file
+        // Not downloaded yet: what the provider is expected to deliver. Clients size their
+        // buffers and pick a decoder from this, so a FLAC stream announced as 128 kbps MP3
+        // starts choppy.
+        if (song.ExpectedFormat is { } expected)
+        {
+            return (expected.Suffix, expected.ContentType, expected.BitRate);
+        }
+
+        // Providers that cannot tell (Tidal, SquidWTF, Yandex)
         return ("mp3", "audio/mpeg", 128);
     }
 
