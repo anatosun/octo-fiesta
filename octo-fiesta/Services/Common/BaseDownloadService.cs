@@ -34,17 +34,13 @@ public abstract class BaseDownloadService : IDownloadService
 
     protected readonly ConcurrentDictionary<string, DownloadInfo> ActiveDownloads = new();
 
-    // Two requests for the same track never download it twice
-    private readonly KeyedLock _songLocks = new();
+    // The download running for each track, which every other request for that track joins.
+    // Key: "ext-{provider}-{externalId}"
+    private readonly ConcurrentDictionary<string, TrackDownload> _runningDownloads = new();
 
     // Album, playlist, star and quality-upgrade downloads run one at a time. Playback requests
     // skip this queue, so a background album never holds up the track being listened to.
-    private readonly SemaphoreSlim _backgroundDownloadLock = new(1, 1);
-
-    // Downloads that can be read while still in progress, and playback requests waiting for one.
-    // Key: "ext-{provider}-{externalId}"
-    private readonly ConcurrentDictionary<string, ProgressiveDownload> _progressiveDownloads = new();
-    private readonly ConcurrentDictionary<string, TaskCompletionSource<ProgressiveDownload>> _streamWaiters = new();
+    private readonly SemaphoreSlim _backgroundQueue = new(1, 1);
 
     // Scratch files for progressive downloads. Kept out of the download folder so library
     // watchers never see half-written tracks.
@@ -167,47 +163,22 @@ public abstract class BaseDownloadService : IDownloadService
     /// </summary>
     public async Task<(Stream Stream, string FilePath)> DownloadAndStreamAsync(string externalProvider, string externalId, CancellationToken cancellationToken = default)
     {
-        var songId = $"ext-{externalProvider}-{externalId}";
+        EnsureProvider(externalProvider);
 
-        // Register before looking for a running download, so one announced in between is not missed
-        var waiter = _streamWaiters.GetOrAdd(songId,
-            _ => new TaskCompletionSource<ProgressiveDownload>(TaskCreationOptions.RunContinuationsAsynchronously));
-        try
+        // Playback skips the background queue, and follows the track's download if one is already running
+        var download = await StartOrJoinAsync(new DownloadRequest(externalId, TriggerAlbumDownload: true, ForcePermanent: false), cancellationToken);
+
+        if (await download.Readable.WaitAsync(cancellationToken) is { } progressive
+            && progressive.TryOpenReader() is { } reader)
         {
-            // Already being downloaded (e.g. by the album queue): follow that download
-            if (_progressiveDownloads.TryGetValue(songId, out var running) && TryOpenProgressive(running) is { } attached)
-            {
-                Logger.LogInformation("Streaming {SongId} from the download already in progress", songId);
-                return attached;
-            }
-
-            var download = DownloadSongInternalAsync(externalProvider, externalId, triggerAlbumDownload: true,
-                forcePermanent: false, cancellationToken: cancellationToken, interactive: true);
-
-            if (await Task.WhenAny(download, waiter.Task) == waiter.Task
-                && TryOpenProgressive(await waiter.Task) is { } early)
-            {
-                // Failures are logged by the download itself; the reader sees them as an IOException
-                _ = download.ContinueWith(t => _ = t.Exception, TaskContinuationOptions.OnlyOnFaulted);
-                Logger.LogInformation("Streaming {SongId} while it downloads", songId);
-                return early;
-            }
-
-            var localPath = await download;
-            // FileShare.Delete allows move/rename operations while the file is being streamed (required for cache-to-permanent on star)
-            var stream = new FileStream(localPath, FileMode.Open, FileAccess.Read, FileShare.Read | FileShare.Delete);
-            return (stream, localPath);
+            Logger.LogInformation("Streaming {SongId} while it downloads", download.SongId);
+            return (reader, progressive.TargetPath);
         }
-        finally
-        {
-            _streamWaiters.TryRemove(new KeyValuePair<string, TaskCompletionSource<ProgressiveDownload>>(songId, waiter));
-        }
-    }
 
-    private static (Stream Stream, string FilePath)? TryOpenProgressive(ProgressiveDownload download)
-    {
-        var reader = download.TryOpenReader();
-        return reader == null ? null : (reader, download.TargetPath);
+        var localPath = await download.Completed.WaitAsync(cancellationToken);
+        // FileShare.Delete allows move/rename operations while the file is being streamed (required for cache-to-permanent on star)
+        var stream = new FileStream(localPath, FileMode.Open, FileAccess.Read, FileShare.Read | FileShare.Delete);
+        return (stream, localPath);
     }
 
     public DownloadInfo? GetDownloadStatus(string songId)
@@ -569,61 +540,148 @@ public abstract class BaseDownloadService : IDownloadService
     #region Common Download Logic
 
     /// <summary>
-    /// Internal method for downloading a song with control over album download triggering
+    /// What to download and where it goes.
     /// </summary>
-    /// <param name="externalProvider">The external provider name</param>
-    /// <param name="externalId">The external track ID</param>
-    /// <param name="triggerAlbumDownload">Whether to trigger album download in Album mode</param>
-    /// <param name="forcePermanent">If true, downloads to permanent storage even in Cache mode (used for star album/playlist)</param>
-    /// <param name="cancellationToken">Cancellation token</param>
-    /// <param name="interactive">True for playback requests, which skip the background download queue</param>
-    protected async Task<string> DownloadSongInternalAsync(string externalProvider, string externalId, bool triggerAlbumDownload, bool forcePermanent = false, CancellationToken cancellationToken = default, bool interactive = false)
+    /// <param name="ExternalId">The external track ID</param>
+    /// <param name="TriggerAlbumDownload">Whether to trigger album download in Album mode</param>
+    /// <param name="ForcePermanent">If true, downloads to permanent storage even in Cache mode (used for star album/playlist)</param>
+    /// <param name="Metadata">The track as already fetched with its album, which spares the provider the metadata lookups</param>
+    private sealed record DownloadRequest(string ExternalId, bool TriggerAlbumDownload, bool ForcePermanent, Song? Metadata = null);
+
+    /// <summary>
+    /// A track download in progress. Every request for the same track shares it.
+    /// </summary>
+    private sealed class TrackDownload(string songId, bool toCache)
+    {
+        private readonly TaskCompletionSource<ProgressiveDownload?> _readable = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private readonly TaskCompletionSource<string> _completed = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public string SongId { get; } = songId;
+
+        public bool ToCache { get; } = toCache;
+
+        /// <summary>
+        /// The download as soon as its first bytes can be read, or null, at the latest just before
+        /// <see cref="Completed"/>, when the track is only served once finished.
+        /// </summary>
+        public Task<ProgressiveDownload?> Readable => _readable.Task;
+
+        /// <summary>The finished track's path.</summary>
+        public Task<string> Completed => _completed.Task;
+
+        public void SetReadable(ProgressiveDownload download) => _readable.TrySetResult(download);
+
+        public void Complete(string path)
+        {
+            _readable.TrySetResult(null);
+            _completed.TrySetResult(path);
+        }
+
+        public void Fail(Exception error)
+        {
+            _readable.TrySetResult(null);
+            _completed.TrySetException(error);
+            // Logged by the download itself; a reader that started early may never look at it
+            _ = _completed.Task.Exception;
+        }
+    }
+
+    private void EnsureProvider(string externalProvider)
     {
         if (externalProvider != ProviderName)
         {
             throw new NotSupportedException($"Provider '{externalProvider}' is not supported");
         }
+    }
 
-        var songId = $"ext-{externalProvider}-{externalId}";
+    /// <summary>
+    /// Downloads a track as a background job: one at a time, behind any playback in progress.
+    /// </summary>
+    private async Task<string> DownloadSongInternalAsync(string externalProvider, string externalId, bool triggerAlbumDownload, bool forcePermanent = false, CancellationToken cancellationToken = default, Song? metadata = null)
+    {
+        EnsureProvider(externalProvider);
 
-        if (!interactive)
-        {
-            await _backgroundDownloadLock.WaitAsync(cancellationToken);
-        }
-
-        IDisposable songLock;
+        await _backgroundQueue.WaitAsync(cancellationToken);
         try
         {
-            // Acquire lock BEFORE checking existence to prevent race conditions with concurrent requests
-            songLock = await _songLocks.AcquireAsync(songId, cancellationToken);
-        }
-        catch
-        {
-            if (!interactive)
-            {
-                _backgroundDownloadLock.Release();
-            }
-            throw;
-        }
-
-        try
-        {
-            return await DownloadSongLockedAsync(externalProvider, externalId, songId, triggerAlbumDownload, forcePermanent, cancellationToken);
+            var download = await StartOrJoinAsync(new DownloadRequest(externalId, triggerAlbumDownload, forcePermanent, metadata), cancellationToken);
+            return await download.Completed.WaitAsync(cancellationToken);
         }
         finally
         {
-            songLock.Dispose();
-            if (!interactive)
+            _backgroundQueue.Release();
+        }
+    }
+
+    /// <summary>
+    /// Returns the download running for the track, or starts one. A request that only joins
+    /// keeps its own cancellation token for waiting; the download runs with the starter's.
+    /// </summary>
+    private async Task<TrackDownload> StartOrJoinAsync(DownloadRequest request, CancellationToken cancellationToken)
+    {
+        var songId = $"ext-{ProviderName}-{request.ExternalId}";
+        // In Cache mode, downloads go to cache unless forcePermanent is set (used by star album/playlist)
+        var toCache = SubsonicSettings.StorageMode == StorageMode.Cache && !request.ForcePermanent;
+
+        while (true)
+        {
+            var candidate = new TrackDownload(songId, toCache);
+            var running = _runningDownloads.GetOrAdd(songId, candidate);
+            if (running == candidate)
             {
-                _backgroundDownloadLock.Release();
+                _ = RunAsync(candidate, request, cancellationToken);
+                return candidate;
+            }
+            if (running.ToCache == toCache)
+            {
+                return running;
+            }
+
+            // Same track for the other storage (e.g. starred while it plays from the cache):
+            // once that download ends, this one finds its file or downloads its own copy
+            try
+            {
+                await running.Completed.WaitAsync(cancellationToken);
+            }
+            catch (Exception) when (!cancellationToken.IsCancellationRequested)
+            {
+                // Its failure belongs to its own requests
             }
         }
     }
 
-    private async Task<string> DownloadSongLockedAsync(string externalProvider, string externalId, string songId, bool triggerAlbumDownload, bool forcePermanent, CancellationToken cancellationToken)
+    private async Task RunAsync(TrackDownload download, DownloadRequest request, CancellationToken cancellationToken)
     {
-        // In Cache mode, downloads go to cache unless forcePermanent is set (used by star album/playlist)
-        var isCache = SubsonicSettings.StorageMode == StorageMode.Cache && !forcePermanent;
+        string? path = null;
+        Exception? error = null;
+        try
+        {
+            path = await DownloadSongCoreAsync(download, request, cancellationToken);
+        }
+        catch (Exception ex)
+        {
+            error = ex;
+        }
+
+        // Dropped before completing, so a request after a failure retries instead of joining it
+        _runningDownloads.TryRemove(new KeyValuePair<string, TrackDownload>(download.SongId, download));
+        if (error != null)
+        {
+            download.Fail(error);
+        }
+        else
+        {
+            download.Complete(path!);
+        }
+    }
+
+    private async Task<string> DownloadSongCoreAsync(TrackDownload download, DownloadRequest request, CancellationToken cancellationToken)
+    {
+        var externalProvider = ProviderName;
+        var externalId = request.ExternalId;
+        var songId = download.SongId;
+        var isCache = download.ToCache;
+        var triggerAlbumDownload = request.TriggerAlbumDownload;
 
         // Tell other concurrent tasks we are started downloading routine
         // and keep reference to it for easy access
@@ -712,12 +770,12 @@ public abstract class BaseDownloadService : IDownloadService
                 }
             }
 
-            Song song = await GetSongMetadataForTrackAsync(externalProvider, externalId);
+            Song song = request.Metadata ?? await GetSongMetadataForTrackAsync(externalProvider, externalId);
             var downloadResult = await DownloadTrackAsync(externalId, song, cancellationToken);
             string localPath;
             await using (downloadResult.DownloadStream)
             {
-                localPath = await SaveDownloadStreamToFileAsync(downloadResult, song, isCache, cancellationToken, songId);
+                localPath = await SaveDownloadStreamToFileAsync(downloadResult, song, isCache, cancellationToken, download.SetReadable);
             }
             song.LocalPath = localPath;
 
@@ -890,8 +948,8 @@ public abstract class BaseDownloadService : IDownloadService
     /// <param name="result">DownloadResult containing download Stream and quality string.</param>
     /// <param name="song">Song metadata to interpolate into storage template.</param>
     /// <returns></returns>
-    /// <param name="songId">When set and the provider announced the size, the download can be streamed while in progress.</param>
-    protected async Task<string> SaveDownloadStreamToFileAsync(DownloadResult result, Song song, bool toCache, CancellationToken cancellationToken, string? songId = null)
+    /// <param name="onReadable">When set and the provider announced the size, receives the download as soon as it can be streamed.</param>
+    protected async Task<string> SaveDownloadStreamToFileAsync(DownloadResult result, Song song, bool toCache, CancellationToken cancellationToken, Action<ProgressiveDownload>? onReadable = null)
     {
         var basePath = toCache ? CachePath : DownloadPath;
         var outputPath = PathHelper.BuildTrackPath(basePath, song, result.Extension, SubsonicSettings.FolderTemplate, result.DownloadedQuality);
@@ -907,9 +965,9 @@ public abstract class BaseDownloadService : IDownloadService
         try
         {
             // Fragmented MP4 is patched after download, so it is only ever served finished
-            if (songId != null && result.ContentLength is > 0 && result.Mp4DurationSeconds == null)
+            if (onReadable != null && result.ContentLength is > 0 && result.Mp4DurationSeconds == null)
             {
-                progressive = await DownloadProgressivelyAsync(result, song, songId, outputPath, cancellationToken);
+                progressive = await DownloadProgressivelyAsync(result, song, outputPath, onReadable, cancellationToken);
 
                 // Readers keep following the raw scratch file; tagging rewrites the start of
                 // a file, so it works on a copy of its own.
@@ -959,22 +1017,32 @@ public abstract class BaseDownloadService : IDownloadService
         }
         finally
         {
+            // Readers already streaming keep their open handle; new requests use the finished file
             if (progressive != null)
             {
-                EndProgressive(songId!, progressive);
+                TryDeleteStreamingFile(progressive.PartPath);
             }
         }
     }
 
     /// <summary>
-    /// Copies the provider stream into a scratch file and announces it to playback requests
+    /// Copies the provider stream into a scratch file, handing it to <paramref name="onReadable"/>
     /// once the format is known. Returns when the whole track is on disk.
     /// </summary>
-    private async Task<ProgressiveDownload> DownloadProgressivelyAsync(DownloadResult result, Song song, string songId, string outputPath, CancellationToken cancellationToken)
+    private async Task<ProgressiveDownload> DownloadProgressivelyAsync(DownloadResult result, Song song, string outputPath, Action<ProgressiveDownload> onReadable, CancellationToken cancellationToken)
     {
         Directory.CreateDirectory(StreamingPath);
         var partPath = Path.Combine(StreamingPath, $"{Guid.NewGuid():N}.part");
+        var length = result.ContentLength!.Value;
         ProgressiveDownload? progressive = null;
+
+        ProgressiveDownload Open()
+        {
+            var extension = DetectAudioExtension(partPath) ?? Path.GetExtension(outputPath);
+            var opened = new ProgressiveDownload(partPath, length, Path.ChangeExtension(outputPath, extension));
+            onReadable(opened);
+            return opened;
+        }
 
         try
         {
@@ -986,20 +1054,20 @@ public abstract class BaseDownloadService : IDownloadService
                 {
                     if (progressive == null && totalBytes >= FormatHeaderBytes)
                     {
-                        progressive = AnnounceProgressive(songId, partPath, result.ContentLength!.Value, outputPath);
+                        progressive = Open();
                     }
                     progressive?.ReportProgress(totalBytes);
                 });
             }
 
             // Shorter than a format header: still hand it to any waiting reader
-            progressive ??= AnnounceProgressive(songId, partPath, result.ContentLength!.Value, outputPath);
+            progressive ??= Open();
 
             var written = new FileInfo(partPath).Length;
-            if (written != progressive.Length)
+            if (written != length)
             {
                 Logger.LogWarning("Download of '{Title}' ended at {Written} bytes, {Expected} were announced",
-                    song.Title, written, progressive.Length);
+                    song.Title, written, length);
             }
             progressive.ReportProgress(written);
             progressive.Complete();
@@ -1007,38 +1075,10 @@ public abstract class BaseDownloadService : IDownloadService
         }
         catch (Exception ex)
         {
-            if (progressive != null)
-            {
-                progressive.Fail(ex);
-                EndProgressive(songId, progressive);
-            }
-            else
-            {
-                TryDeleteStreamingFile(partPath);
-            }
+            progressive?.Fail(ex);
+            TryDeleteStreamingFile(partPath);
             throw;
         }
-    }
-
-    private ProgressiveDownload AnnounceProgressive(string songId, string partPath, long length, string outputPath)
-    {
-        var extension = DetectAudioExtension(partPath) ?? Path.GetExtension(outputPath);
-        var progressive = new ProgressiveDownload(partPath, length, Path.ChangeExtension(outputPath, extension));
-
-        // Registered before waking waiters, so a request arriving now finds it either way
-        _progressiveDownloads[songId] = progressive;
-        if (_streamWaiters.TryRemove(songId, out var waiter))
-        {
-            waiter.TrySetResult(progressive);
-        }
-        return progressive;
-    }
-
-    // Readers already streaming keep their open handle; new requests use the finished file
-    private void EndProgressive(string songId, ProgressiveDownload progressive)
-    {
-        _progressiveDownloads.TryRemove(new KeyValuePair<string, ProgressiveDownload>(songId, progressive));
-        TryDeleteStreamingFile(progressive.PartPath);
     }
 
     private void TryDeleteStreamingFile(string path)
@@ -1269,7 +1309,8 @@ public abstract class BaseDownloadService : IDownloadService
                 }
 
                 Logger.LogInformation("Downloading track '{Title}' from album '{Album}'", track.Title, album.Title);
-                await DownloadSongInternalAsync(ProviderName, track.ExternalId!, triggerAlbumDownload: false, forcePermanent, cancellationToken);
+                // The album listing already carries the track's full metadata, album artist included
+                await DownloadSongInternalAsync(ProviderName, track.ExternalId!, triggerAlbumDownload: false, forcePermanent, cancellationToken, metadata: track);
             }
             catch (Exception ex)
             {

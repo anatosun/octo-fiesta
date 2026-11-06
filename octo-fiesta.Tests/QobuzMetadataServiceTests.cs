@@ -706,4 +706,68 @@ public class QobuzMetadataServiceTests
     }
     
     #endregion
+
+    #region Catalog cache
+
+    [Fact]
+    public async Task GetAlbumAsync_AskedTwice_CallsQobuzOnce()
+    {
+        var calls = 0;
+        _httpMessageHandlerMock.Protected()
+            .Setup<Task<HttpResponseMessage>>("SendAsync", ItExpr.IsAny<HttpRequestMessage>(), ItExpr.IsAny<CancellationToken>())
+            .ReturnsAsync(() =>
+            {
+                Interlocked.Increment(ref calls);
+                return new HttpResponseMessage(HttpStatusCode.OK)
+                {
+                    Content = new StringContent(@"{""id"": ""42"", ""title"": ""Album"", ""artist"": {""id"": 1, ""name"": ""Artist""}}")
+                };
+            });
+
+        var first = await _service.GetAlbumAsync("qobuz", "42");
+        var second = await _service.GetAlbumAsync("qobuz", "42");
+
+        Assert.Equal("Album", first!.Title);
+        Assert.Equal("Album", second!.Title);
+        Assert.NotSame(first, second);
+        Assert.Equal(1, calls);
+    }
+
+    [Fact]
+    public async Task GetSongAsync_AfterAFailure_AsksQobuzAgain()
+    {
+        var calls = 0;
+        _httpMessageHandlerMock.Protected()
+            .Setup<Task<HttpResponseMessage>>("SendAsync", ItExpr.IsAny<HttpRequestMessage>(), ItExpr.IsAny<CancellationToken>())
+            .ReturnsAsync(() =>
+            {
+                Interlocked.Increment(ref calls);
+                return new HttpResponseMessage(HttpStatusCode.InternalServerError);
+            });
+
+        Assert.Null(await _service.GetSongAsync("qobuz", "7"));
+        Assert.Null(await _service.GetSongAsync("qobuz", "7"));
+
+        Assert.Equal(2, calls);
+    }
+
+    [Fact]
+    public async Task SearchSongsAsync_IsNeverCached()
+    {
+        var calls = 0;
+        _httpMessageHandlerMock.Protected()
+            .Setup<Task<HttpResponseMessage>>("SendAsync", ItExpr.IsAny<HttpRequestMessage>(), ItExpr.IsAny<CancellationToken>())
+            .ReturnsAsync(() =>
+            {
+                Interlocked.Increment(ref calls);
+                return new HttpResponseMessage(HttpStatusCode.OK) { Content = new StringContent(@"{""tracks"": {""items"": []}}") };
+            });
+
+        await _service.SearchSongsAsync("query");
+        await _service.SearchSongsAsync("query");
+
+        Assert.Equal(2, calls);
+    }
+
+    #endregion
 }

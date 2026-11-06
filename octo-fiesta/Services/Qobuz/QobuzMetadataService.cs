@@ -570,6 +570,82 @@ public class QobuzMetadataService : IMusicMetadataService
     /// </summary>
     private async Task<HttpResponseMessage> GetWithAuthAsync(string url)
     {
+        if (!IsCacheableCatalogLookup(url))
+        {
+            return await SendWithAuthAsync(url);
+        }
+
+        // Playing, tagging and album downloads ask for the same track and album several times
+        // within seconds; answering from memory keeps the request count towards Qobuz low.
+        var now = DateTime.UtcNow;
+        PurgeExpiredCatalogResponses(now);
+
+        var entry = _catalogResponses.AddOrUpdate(url,
+            _ => new CatalogResponse(FetchCatalogBodyAsync(url), now + CatalogCacheTtl),
+            (_, existing) => existing.Expiry > now && !existing.Body.IsFaulted
+                ? existing
+                : new CatalogResponse(FetchCatalogBodyAsync(url), now + CatalogCacheTtl));
+
+        var body = await entry.Body;
+        if (body == null)
+        {
+            // Not cached: a failure is asked again next time
+            _catalogResponses.TryRemove(new KeyValuePair<string, CatalogResponse>(url, entry));
+            return new HttpResponseMessage(System.Net.HttpStatusCode.BadGateway);
+        }
+
+        return new HttpResponseMessage(System.Net.HttpStatusCode.OK)
+        {
+            Content = new StringContent(body, System.Text.Encoding.UTF8, "application/json")
+        };
+    }
+
+    private sealed record CatalogResponse(Task<string?> Body, DateTime Expiry);
+
+    private static readonly TimeSpan CatalogCacheTtl = TimeSpan.FromMinutes(10);
+    private const int CatalogCacheMaxEntries = 2000;
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<string, CatalogResponse> _catalogResponses = new();
+
+    // Catalog data that does not change from one minute to the next. Searches and playlists
+    // (which their owner may be editing) always go to Qobuz.
+    private static bool IsCacheableCatalogLookup(string url) =>
+        url.StartsWith($"{BaseUrl}track/get?", StringComparison.Ordinal)
+        || url.StartsWith($"{BaseUrl}album/get?", StringComparison.Ordinal)
+        || url.StartsWith($"{BaseUrl}artist/get?", StringComparison.Ordinal);
+
+    /// <summary>The body of a successful response, or null.</summary>
+    private async Task<string?> FetchCatalogBodyAsync(string url)
+    {
+        // Off the caller's stack, so the first caller's own state never leaks into the shared task
+        await Task.Yield();
+        using var response = await SendWithAuthAsync(url);
+        return response.IsSuccessStatusCode ? await response.Content.ReadAsStringAsync() : null;
+    }
+
+    private void PurgeExpiredCatalogResponses(DateTime now)
+    {
+        if (_catalogResponses.Count < CatalogCacheMaxEntries)
+        {
+            return;
+        }
+
+        foreach (var (key, value) in _catalogResponses)
+        {
+            if (value.Expiry <= now)
+            {
+                _catalogResponses.TryRemove(new KeyValuePair<string, CatalogResponse>(key, value));
+            }
+        }
+
+        // Still full of fresh entries: start over rather than grow without bound
+        if (_catalogResponses.Count >= CatalogCacheMaxEntries)
+        {
+            _catalogResponses.Clear();
+        }
+    }
+
+    private async Task<HttpResponseMessage> SendWithAuthAsync(string url)
+    {
         using var request = new HttpRequestMessage(HttpMethod.Get, url);
         
         var appId = await _bundleService.GetAppIdAsync();

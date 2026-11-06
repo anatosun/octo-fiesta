@@ -207,21 +207,56 @@ public class BaseDownloadServiceStreamingTests : IDisposable
     }
 
     [Fact]
-    public async Task KeyedLock_SerializesOneKeyOnly()
+    public async Task DownloadAndStreamAsync_AfterAFailedDownload_StartsAFreshOne()
     {
-        var locks = new KeyedLock();
-        var held = await locks.AcquireAsync("a");
+        var service = CreateService();
+        var failing = service.AddTrack("1", length: null);
+        await failing.CompleteAsync(new HttpRequestException("connection reset"));
+        await Assert.ThrowsAnyAsync<Exception>(() => service.DownloadAndStreamAsync("fake", "1").WaitAsync(Timeout));
 
-        var sameKey = locks.AcquireAsync("a");
-        var otherKey = await locks.AcquireAsync("b").WaitAsync(Timeout);
-        Assert.False(sameKey.IsCompleted);
+        var retry = service.AddTrack("1", length: null);
+        await retry.WriteAsync(FlacHeader);
+        await retry.CompleteAsync();
+        var (stream, _) = await service.DownloadAndStreamAsync("fake", "1").WaitAsync(Timeout);
+        await stream.DisposeAsync();
 
-        held.Dispose();
-        (await sameKey.WaitAsync(Timeout)).Dispose();
-        otherKey.Dispose();
+        Assert.Equal(2, service.RequestedTracks.Count(id => id == "1"));
     }
 
-    private FakeStreamingDownloadService CreateService()
+    [Fact]
+    public async Task AlbumDownload_TakesTrackMetadataFromTheAlbumListing()
+    {
+        var metadata = new Mock<IMusicMetadataService>();
+        metadata
+            .Setup(x => x.GetAlbumAsync("fake", "album"))
+            .ReturnsAsync(new Album
+            {
+                Id = "album",
+                Title = "Album",
+                Artist = "Artist",
+                Songs =
+                [
+                    new Song { ExternalId = "a", Title = "A", Artist = "Artist", Album = "Album" },
+                    new Song { ExternalId = "b", Title = "B", Artist = "Artist", Album = "Album" }
+                ]
+            });
+        var service = CreateService(metadata);
+        foreach (var id in new[] { "a", "b" })
+        {
+            var track = service.AddTrack(id, length: null);
+            await track.WriteAsync(FlacHeader);
+            await track.CompleteAsync();
+        }
+
+        service.DownloadFullAlbumInBackground("fake", "album");
+        await WaitForStatusAsync(service, "ext-fake-a", DownloadStatus.Completed);
+        await WaitForStatusAsync(service, "ext-fake-b", DownloadStatus.Completed);
+
+        metadata.Verify(x => x.GetAlbumAsync("fake", "album"), Times.Once);
+        metadata.Verify(x => x.GetSongAsync(It.IsAny<string>(), It.IsAny<string>()), Times.Never);
+    }
+
+    private FakeStreamingDownloadService CreateService(Mock<IMusicMetadataService>? metadataOverride = null)
     {
         // Behaves like the real library: a registered download is found on the next lookup
         var registered = new ConcurrentDictionary<string, LocalSongMapping>();
@@ -239,16 +274,19 @@ public class BaseDownloadServiceStreamingTests : IDisposable
         localLibrary
             .Setup(x => x.GetMappingForExternalSongAsync("fake", It.IsAny<string>()))
             .ReturnsAsync((string _, string id) => registered.GetValueOrDefault(id));
-        var metadata = new Mock<IMusicMetadataService>();
-        metadata
-            .Setup(x => x.GetSongAsync("fake", It.IsAny<string>()))
-            .ReturnsAsync((string _, string id) => new Song
-            {
-                ExternalId = id,
-                Title = "Track " + id,
-                Artist = "Artist",
-                Album = "Album"
-            });
+        var metadata = metadataOverride ?? new Mock<IMusicMetadataService>();
+        if (metadataOverride == null)
+        {
+            metadata
+                .Setup(x => x.GetSongAsync("fake", It.IsAny<string>()))
+                .ReturnsAsync((string _, string id) => new Song
+                {
+                    ExternalId = id,
+                    Title = "Track " + id,
+                    Artist = "Artist",
+                    Album = "Album"
+                });
+        }
 
         var config = new ConfigurationBuilder()
             .AddInMemoryCollection(new Dictionary<string, string?> { ["Library:DownloadPath"] = _downloadPath })
