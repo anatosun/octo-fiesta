@@ -37,6 +37,8 @@ services:
       - Subsonic__AutoUpgradeQuality=${AUTO_UPGRADE_QUALITY:-false}
       # Seconds of audio downloaded before an undownloaded track starts playing (default: 3)
       - Subsonic__StreamPrebufferSeconds=${STREAM_PREBUFFER_SECONDS:-3}
+      # Tracks downloaded from the provider account at once (default: 1). Higher values risk a ban
+      - Subsonic__MaxConcurrentDownloads=${MAX_CONCURRENT_DOWNLOADS:-1}
       # Disable triggering a library scan after a download completes (default: false)
       # Useful if your Subsonic server or an external automation already picks up new files
       - Subsonic__DisableLibraryScan=${DISABLE_LIBRARY_SCAN:-false}

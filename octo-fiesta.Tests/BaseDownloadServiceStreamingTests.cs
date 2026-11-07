@@ -69,9 +69,9 @@ public class BaseDownloadServiceStreamingTests : IDisposable
     }
 
     [Fact]
-    public async Task DownloadAndStreamAsync_IsNotQueuedBehindBackgroundDownloads()
+    public async Task DownloadAndStreamAsync_WithTwoSlots_IsNotQueuedBehindBackgroundDownloads()
     {
-        var service = CreateService();
+        var service = CreateService(maxConcurrentDownloads: 2);
         var background = service.AddTrack("bg", length: 100);
         var played = service.AddTrack("fg", length: FlacHeader.Length);
 
@@ -88,6 +88,109 @@ public class BaseDownloadServiceStreamingTests : IDisposable
         Assert.False(backgroundDownload.IsCompleted);
         await background.CompleteAsync();
         await backgroundDownload.WaitAsync(Timeout);
+    }
+
+    [Fact]
+    public async Task PlaybackOfAnotherTrack_WaitsForTheRunningProviderDownload()
+    {
+        // Skipping ahead, or a client prefetching the next tracks, must not pull them in parallel
+        var service = CreateService();
+        var first = service.AddTrack("a", length: FlacHeader.Length + 1);
+        var second = service.AddTrack("b", length: FlacHeader.Length);
+
+        await first.WriteAsync(FlacHeader);
+        var (firstStream, _) = await service.DownloadAndStreamAsync("fake", "a").WaitAsync(Timeout);
+        await firstStream.DisposeAsync();
+
+        await second.WriteAsync(FlacHeader);
+        await second.CompleteAsync();
+        var secondStream = service.DownloadAndStreamAsync("fake", "b");
+        await Task.Delay(100);
+        Assert.DoesNotContain("b", service.RequestedTracks);
+        Assert.False(secondStream.IsCompleted);
+
+        await first.WriteAsync([1]);
+        await first.CompleteAsync();
+        var (stream, _) = await secondStream.WaitAsync(Timeout);
+        await stream.DisposeAsync();
+    }
+
+    [Fact]
+    public async Task WaitingPlayback_GoesAheadOfWaitingBackgroundDownloads()
+    {
+        var service = CreateService();
+        var playing = service.AddTrack("playing", length: null);
+        service.AddTrack("bg", length: null);
+        var next = service.AddTrack("next", length: null);
+
+        var playingStream = service.DownloadAndStreamAsync("fake", "playing");
+        await WaitUntilAsync(() => service.RequestedTracks.Contains("playing"));
+        var backgroundDownload = service.DownloadSongAsync("fake", "bg");
+        await WaitForStatusAsync(service, "ext-fake-bg", DownloadStatus.InProgress);
+        var nextStream = service.DownloadAndStreamAsync("fake", "next");
+        await WaitForStatusAsync(service, "ext-fake-next", DownloadStatus.InProgress);
+
+        await playing.WriteAsync(FlacHeader);
+        await playing.CompleteAsync();
+        await (await playingStream.WaitAsync(Timeout)).Stream.DisposeAsync();
+
+        await WaitUntilAsync(() => service.RequestedTracks.Contains("next"));
+        Assert.DoesNotContain("bg", service.RequestedTracks);
+
+        await next.WriteAsync(FlacHeader);
+        await next.CompleteAsync();
+        await (await nextStream.WaitAsync(Timeout)).Stream.DisposeAsync();
+        await WaitUntilAsync(() => service.RequestedTracks.Contains("bg"));
+        Assert.False(backgroundDownload.IsCompleted);
+    }
+
+    [Fact]
+    public async Task PlayingAQueuedBackgroundTrack_MovesItAheadOfLaterPlayback()
+    {
+        var service = CreateService();
+        var playing = service.AddTrack("playing", length: null);
+        var queued = service.AddTrack("queued", length: null);
+        service.AddTrack("later", length: null);
+
+        var playingStream = service.DownloadAndStreamAsync("fake", "playing");
+        await WaitUntilAsync(() => service.RequestedTracks.Contains("playing"));
+        _ = service.DownloadSongAsync("fake", "queued");
+        await WaitForStatusAsync(service, "ext-fake-queued", DownloadStatus.InProgress);
+
+        // The queued album track is now being listened to, then another track is asked for
+        var queuedStream = service.DownloadAndStreamAsync("fake", "queued");
+        await Task.Delay(50);
+        _ = service.DownloadAndStreamAsync("fake", "later");
+        await WaitForStatusAsync(service, "ext-fake-later", DownloadStatus.InProgress);
+
+        await playing.WriteAsync(FlacHeader);
+        await playing.CompleteAsync();
+        await (await playingStream.WaitAsync(Timeout)).Stream.DisposeAsync();
+
+        await WaitUntilAsync(() => service.RequestedTracks.Contains("queued"));
+        Assert.DoesNotContain("later", service.RequestedTracks);
+        await queued.WriteAsync(FlacHeader);
+        await queued.CompleteAsync();
+        await (await queuedStream.WaitAsync(Timeout)).Stream.DisposeAsync();
+    }
+
+    [Fact]
+    public async Task DownloadGate_CancelledWaiter_GivesUpItsTurn()
+    {
+        var gate = new DownloadGate(1);
+        var holder = gate.Enter(playback: true);
+        var abandoned = gate.Enter(playback: true);
+        var next = gate.Enter(playback: false);
+
+        abandoned.Dispose();
+        holder.Dispose();
+
+        await next.Granted.WaitAsync(Timeout);
+        Assert.False(abandoned.Granted.IsCompleted);
+
+        // The slot is free again once its holder leaves
+        next.Dispose();
+        Assert.True(gate.Enter(playback: false).Granted.IsCompleted);
     }
 
     [Fact]
@@ -298,7 +401,7 @@ public class BaseDownloadServiceStreamingTests : IDisposable
         metadata.Verify(x => x.GetSongAsync(It.IsAny<string>(), It.IsAny<string>()), Times.Never);
     }
 
-    private FakeStreamingDownloadService CreateService(Mock<IMusicMetadataService>? metadataOverride = null, double prebufferSeconds = 0)
+    private FakeStreamingDownloadService CreateService(Mock<IMusicMetadataService>? metadataOverride = null, double prebufferSeconds = 0, int maxConcurrentDownloads = 1)
     {
         // Behaves like the real library: a registered download is found on the next lookup
         var registered = new ConcurrentDictionary<string, LocalSongMapping>();
@@ -339,7 +442,7 @@ public class BaseDownloadServiceStreamingTests : IDisposable
             config,
             localLibrary.Object,
             metadata.Object,
-            new SubsonicSettings { StreamPrebufferSeconds = prebufferSeconds },
+            new SubsonicSettings { StreamPrebufferSeconds = prebufferSeconds, MaxConcurrentDownloads = maxConcurrentDownloads },
             new Mock<IServiceProvider>().Object,
             NullLogger.Instance);
     }
