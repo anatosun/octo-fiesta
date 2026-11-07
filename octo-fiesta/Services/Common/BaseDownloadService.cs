@@ -42,6 +42,9 @@ public abstract class BaseDownloadService : IDownloadService
     // skip this queue, so a background album never holds up the track being listened to.
     private readonly SemaphoreSlim _backgroundQueue = new(1, 1);
 
+    // How many tracks come off the provider account at once, playback and background together
+    private readonly DownloadGate _downloadGate;
+
     // Scratch files for progressive downloads. Kept out of the download folder so library
     // watchers never see half-written tracks.
     private static readonly string StreamingPath = Path.Combine(Path.GetTempPath(), "octo-fiesta-stream");
@@ -109,6 +112,7 @@ public abstract class BaseDownloadService : IDownloadService
         SubsonicSettings = subsonicSettings;
         _serviceProvider = serviceProvider;
         Logger = logger;
+        _downloadGate = new DownloadGate(subsonicSettings.MaxConcurrentDownloads);
 
         CachePath = PathHelper.GetCachePath();
 
@@ -166,7 +170,7 @@ public abstract class BaseDownloadService : IDownloadService
         EnsureProvider(externalProvider);
 
         // Playback skips the background queue, and follows the track's download if one is already running
-        var download = await StartOrJoinAsync(new DownloadRequest(externalId, TriggerAlbumDownload: true, ForcePermanent: false), cancellationToken);
+        var download = await StartOrJoinAsync(new DownloadRequest(externalId, TriggerAlbumDownload: true, ForcePermanent: false, Playback: true), cancellationToken);
 
         if (await download.Readable.WaitAsync(cancellationToken) is { } progressive)
         {
@@ -550,7 +554,7 @@ public abstract class BaseDownloadService : IDownloadService
     /// <param name="TriggerAlbumDownload">Whether to trigger album download in Album mode</param>
     /// <param name="ForcePermanent">If true, downloads to permanent storage even in Cache mode (used for star album/playlist)</param>
     /// <param name="Metadata">The track as already fetched with its album, which spares the provider the metadata lookups</param>
-    private sealed record DownloadRequest(string ExternalId, bool TriggerAlbumDownload, bool ForcePermanent, Song? Metadata = null);
+    private sealed record DownloadRequest(string ExternalId, bool TriggerAlbumDownload, bool ForcePermanent, Song? Metadata = null, bool Playback = false);
 
     /// <summary>
     /// A track download in progress. Every request for the same track shares it.
@@ -573,7 +577,31 @@ public abstract class BaseDownloadService : IDownloadService
         /// <summary>The finished track's path.</summary>
         public Task<string> Completed => _completed.Task;
 
+        private readonly object _slotLock = new();
+        private DownloadGate.Slot? _slot;
+        private bool _forPlayback;
+
         public void SetReadable(ProgressiveDownload download) => _readable.TrySetResult(download);
+
+        /// <summary>Takes this download's place in the provider queue.</summary>
+        public DownloadGate.Slot EnterGate(DownloadGate gate, bool playback)
+        {
+            lock (_slotLock)
+            {
+                _forPlayback |= playback;
+                return _slot = gate.Enter(_forPlayback);
+            }
+        }
+
+        /// <summary>Someone is listening to this track: it goes ahead of background downloads.</summary>
+        public void MarkForPlayback()
+        {
+            lock (_slotLock)
+            {
+                _forPlayback = true;
+                _slot?.Promote();
+            }
+        }
 
         public void Complete(string path)
         {
@@ -638,6 +666,10 @@ public abstract class BaseDownloadService : IDownloadService
             }
             if (running.ToCache == toCache)
             {
+                if (request.Playback)
+                {
+                    running.MarkForPlayback();
+                }
                 return running;
             }
 
@@ -774,12 +806,25 @@ public abstract class BaseDownloadService : IDownloadService
                 }
             }
 
-            Song song = request.Metadata ?? await GetSongMetadataForTrackAsync(externalProvider, externalId);
-            var downloadResult = await DownloadTrackAsync(externalId, song, cancellationToken);
+            Song song;
+            DownloadResult downloadResult;
             string localPath;
-            await using (downloadResult.DownloadStream)
+            // Held until the whole track is off the provider, so the account never pulls more
+            // tracks at once than MaxConcurrentDownloads allows
+            using (var slot = download.EnterGate(_downloadGate, request.Playback))
             {
-                localPath = await SaveDownloadStreamToFileAsync(downloadResult, song, isCache, cancellationToken, download.SetReadable);
+                if (!slot.Granted.IsCompleted)
+                {
+                    Logger.LogInformation("Waiting for a provider download slot for {SongId}", songId);
+                }
+                await slot.Granted.WaitAsync(cancellationToken);
+
+                song = request.Metadata ?? await GetSongMetadataForTrackAsync(externalProvider, externalId);
+                downloadResult = await DownloadTrackAsync(externalId, song, cancellationToken);
+                await using (downloadResult.DownloadStream)
+                {
+                    localPath = await SaveDownloadStreamToFileAsync(downloadResult, song, isCache, cancellationToken, download.SetReadable);
+                }
             }
             song.LocalPath = localPath;
 

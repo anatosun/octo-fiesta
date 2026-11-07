@@ -179,6 +179,16 @@ public class SubsonicSettings
     /// Environment variable: STREAM_PREBUFFER_SECONDS. 0 starts as soon as the format is known.
     /// </summary>
     public double StreamPrebufferSeconds { get; set; } = 3;
+
+    /// <summary>
+    /// How many tracks are downloaded from the provider account at the same time, playback and
+    /// background downloads together (default: 1). Requests beyond that wait their turn, with
+    /// the track being played ahead of album, playlist and upgrade downloads.
+    /// Raising it is faster but makes the account fetch tracks in parallel, which providers
+    /// can flag as abuse and ban the account for.
+    /// Environment variable: MAX_CONCURRENT_DOWNLOADS
+    /// </summary>
+    public int MaxConcurrentDownloads { get; set; } = 1;
     
     /// <summary>
     /// Template for organizing downloaded files into folders (default: {artist}/{album}/{track} - {title})
