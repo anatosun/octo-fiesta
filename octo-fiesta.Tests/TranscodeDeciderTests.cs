@@ -34,6 +34,13 @@ public class TranscodeDeciderTests
     }
 
     [Fact]
+    public void LosslessUnderCap_WithoutFormat_ServesOriginal()
+    {
+        // A FLAC that compresses below the cap (a quiet or mono track) already fits the client's budget
+        Assert.Null(TranscodeDecider.Decide(new SourceAudio("flac", 110, Lossless: true), null, 128));
+    }
+
+    [Fact]
     public void LossyUnderCap_ServesOriginal()
     {
         Assert.Null(TranscodeDecider.Decide(Mp3At128, null, 320));

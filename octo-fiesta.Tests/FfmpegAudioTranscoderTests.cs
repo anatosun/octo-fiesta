@@ -43,14 +43,18 @@ public class FfmpegAudioTranscoderTests : IDisposable
         }
     });
 
-    /// <summary>Five seconds of a 440 Hz tone as CD-quality FLAC.</summary>
+    /// <summary>
+    /// Five seconds of white noise as CD-quality FLAC. Noise barely compresses, so the file runs
+    /// near 1411 kbps like real music; a pure tone would compress below any lossy cap and rightly
+    /// be served untranscoded.
+    /// </summary>
     private string CreateFlac()
     {
         var path = Path.Combine(_dir, "tone.flac");
         using var process = Process.Start(new ProcessStartInfo("ffmpeg")
         {
             ArgumentList = { "-hide_banner", "-loglevel", "error", "-nostdin", "-f", "lavfi",
-                "-i", "sine=frequency=440:duration=5:sample_rate=44100", "-ac", "2", "-c:a", "flac", path },
+                "-i", "anoisesrc=duration=5:sample_rate=44100:amplitude=0.5", "-ac", "2", "-c:a", "flac", path },
             RedirectStandardError = true,
         })!;
         process.WaitForExit(30_000);
