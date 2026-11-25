@@ -46,6 +46,9 @@ services:
       - Subsonic__StreamWhileDownloading=${STREAM_WHILE_DOWNLOADING:-false}
       # Seconds of audio downloaded before an undownloaded track starts playing (default: 3)
       - Subsonic__StreamPrebufferSeconds=${STREAM_PREBUFFER_SECONDS:-3}
+      # Encode the stream at the client's requested quality, keeping the lossless download (default: true)
+      - Subsonic__EnableTranscoding=${ENABLE_TRANSCODING:-true}
+      - Subsonic__FfmpegPath=${FFMPEG_PATH:-ffmpeg}
       # Disable triggering a library scan after a download completes (default: false)
       # Useful if your Subsonic server or an external automation already picks up new files
       - Subsonic__DisableLibraryScan=${DISABLE_LIBRARY_SCAN:-false}
