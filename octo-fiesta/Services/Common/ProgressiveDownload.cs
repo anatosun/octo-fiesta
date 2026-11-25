@@ -156,6 +156,9 @@ internal sealed class ProgressiveDownloadStream : Stream
         _file = file;
     }
 
+    /// <summary>The download this stream follows.</summary>
+    public ProgressiveDownload Download => _download;
+
     public override bool CanRead => true;
     public override bool CanSeek => true;
     public override bool CanWrite => false;

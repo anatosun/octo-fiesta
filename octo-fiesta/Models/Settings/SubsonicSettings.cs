@@ -227,6 +227,22 @@ public class SubsonicSettings
     /// Environment variable: STREAM_PREBUFFER_SECONDS. 0 starts as soon as the format is known.
     /// </summary>
     public double StreamPrebufferSeconds { get; set; } = 3;
+
+    /// <summary>
+    /// Honor the client's transcoding request (maxBitRate / format) for tracks that are not in
+    /// the Subsonic library yet (default: true). The track is still downloaded and kept at the
+    /// provider quality; only the copy sent to the client is encoded, on the fly, with ffmpeg.
+    /// Tracks the library already holds are relayed to the Subsonic server, which transcodes them.
+    /// Without ffmpeg the original file is served, as before.
+    /// Environment variable: ENABLE_TRANSCODING
+    /// </summary>
+    public bool EnableTranscoding { get; set; } = true;
+
+    /// <summary>
+    /// Path to the ffmpeg executable used for transcoding (default: "ffmpeg", looked up in PATH).
+    /// Environment variable: FFMPEG_PATH
+    /// </summary>
+    public string FfmpegPath { get; set; } = "ffmpeg";
     
     /// <summary>
     /// Template for organizing downloaded files into folders (default: {artist}/{album}/{track} - {title})
