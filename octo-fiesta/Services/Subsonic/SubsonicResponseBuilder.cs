@@ -3,6 +3,7 @@ using System.Xml.Linq;
 using System.Text.Json;
 using octo_fiesta.Models.Domain;
 using octo_fiesta.Models.Subsonic;
+using octo_fiesta.Services.Transcoding;
 
 namespace octo_fiesta.Services.Subsonic;
 
@@ -738,6 +739,81 @@ public class SubsonicResponseBuilder
             }
         });
     }
+
+    /// <summary>
+    /// Describes the stream octo-fiesta would send for this song untranscoded, for an
+    /// OpenSubsonic transcode decision. A file already on disk is measured, so FLAC inside MP4
+    /// (Tidal) is not mistaken for AAC; otherwise the format the provider is expected to deliver.
+    /// </summary>
+    public static (StreamDetails Details, bool Lossless) DescribeSourceStream(Song song)
+    {
+        var (suffix, _, bitRate) = GetSuffixContentTypeAndBitrate(song);
+
+        if (!string.IsNullOrEmpty(song.LocalPath) && File.Exists(song.LocalPath))
+        {
+            try
+            {
+                using var file = new FileStream(song.LocalPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+                var measured = SourceAudioProbe.Probe(file, song.LocalPath);
+                var codec = measured.Suffix switch
+                {
+                    "m4a" or "mp4" => measured.Lossless ? "flac" : "aac",
+                    "ogg" or "oga" => "vorbis",
+                    var other => other
+                };
+                return (new StreamDetails(measured.Suffix, codec, measured.BitRate), measured.Lossless);
+            }
+            catch (IOException)
+            {
+                // Moved or replaced meanwhile: describe it from its name
+            }
+        }
+
+        var expectedCodec = string.IsNullOrEmpty(song.LocalPath) && !song.IsLocal && song.ExpectedFormat is { } expected
+            ? expected.Codec
+            : suffix == "m4a" ? "aac" : suffix;
+        var lossless = expectedCodec is "flac" or "alac" or "pcm" or "wav";
+        return (new StreamDetails(suffix, expectedCodec, bitRate > 0 ? bitRate : 128), lossless);
+    }
+
+    /// <summary>
+    /// Creates an OpenSubsonic transcodeDecision response from a negotiated decision.
+    /// </summary>
+    public IActionResult CreateTranscodeDecisionResponse(NegotiatedDecision decision)
+    {
+        var transcodeDecision = new Dictionary<string, object>
+        {
+            ["canDirectPlay"] = decision.CanDirectPlay,
+            ["canTranscode"] = decision.CanTranscode,
+            ["transcodeReason"] = decision.TranscodeReasons,
+            ["errorReason"] = decision.ErrorReason,
+            ["transcodeParams"] = decision.TranscodeParams,
+            ["sourceStream"] = ToStreamDetails(decision.SourceStream)
+        };
+        // Absent rather than null when there is nothing to transcode to, as Navidrome does
+        if (decision.TranscodeStream is { } target)
+        {
+            transcodeDecision["transcodeStream"] = ToStreamDetails(target);
+        }
+
+        return CreateJsonResponse(new
+        {
+            status = "ok",
+            version = SubsonicVersion,
+            openSubsonic = true,
+            transcodeDecision
+        });
+    }
+
+    /// <summary>Only plain HTTP delivery is offered; "hls" is the other value the spec allows.</summary>
+    private static object ToStreamDetails(StreamDetails details) => new
+    {
+        protocol = "http",
+        container = details.Container,
+        codec = details.Codec,
+        audioChannels = details.Channels,
+        audioBitrate = details.BitRate * 1000
+    };
 
     /// <summary>
     /// Determines the file suffix, MIME content type, and bitrate based on the song's provider and local path.

@@ -32,6 +32,12 @@ public interface IAudioTranscoder
     /// left at its start, ready to be served as is.
     /// </summary>
     Task<TranscodedStream?> TryTranscodeAsync(Stream source, string filePath, TranscodeRequest request, CancellationToken cancellationToken);
+
+    /// <summary>
+    /// Whether transcoding is enabled and ffmpeg works, so a transcode can be promised to a
+    /// client before the stream is requested.
+    /// </summary>
+    Task<bool> IsAvailableAsync();
 }
 
 /// <summary>
@@ -53,6 +59,9 @@ public sealed class FfmpegAudioTranscoder : IAudioTranscoder
         _logger = logger;
         _available = new Lazy<Task<bool>>(CheckAvailabilityAsync);
     }
+
+    public Task<bool> IsAvailableAsync() =>
+        _settings.EnableTranscoding ? _available.Value : Task.FromResult(false);
 
     public async Task<TranscodedStream?> TryTranscodeAsync(Stream source, string filePath, TranscodeRequest request, CancellationToken cancellationToken)
     {

@@ -200,21 +200,32 @@ public class SubsonicController : ControllerBase
             return await _proxyService.RelayStreamAsync(parameters, HttpContext.RequestAborted);
         }
 
+        return await ServeExternalSongAsync(provider!, externalId!, parameters, ReadTranscodeRequest(parameters));
+    }
+
+    /// <summary>
+    /// Plays an ext- song: from the library when it is already there (the Subsonic server then
+    /// honors <paramref name="relayParameters"/>, transcoding included), from the provider
+    /// otherwise, encoded as <paramref name="transcodeRequest"/> asks.
+    /// </summary>
+    private async Task<IActionResult> ServeExternalSongAsync(
+        string provider, string externalId, Dictionary<string, string> relayParameters, TranscodeRequest transcodeRequest)
+    {
         // The player asks for the cover as playback starts; have it ready by then
-        _coverArt.Prefetch(provider!, externalId!);
+        _coverArt.Prefetch(provider, externalId);
 
         // Serve an already-owned copy from the library instead of re-downloading. A copy
         // below the target quality is still served right away, the upgrade runs in background.
-        var ownedSongId = await _localLibraryService.GetLocalIdForExternalSongAsync(provider!, externalId!);
+        var ownedSongId = await _localLibraryService.GetLocalIdForExternalSongAsync(provider, externalId);
         if (!string.IsNullOrEmpty(ownedSongId))
         {
             if (_subsonicSettings.AutoUpgradeQuality)
             {
-                _downloadService.UpgradeQualityInBackground(provider!, externalId!);
+                _downloadService.UpgradeQualityInBackground(provider, externalId);
             }
 
-            parameters["id"] = ownedSongId;
-            return await _proxyService.RelayStreamAsync(parameters, HttpContext.RequestAborted);
+            relayParameters["id"] = ownedSongId;
+            return await _proxyService.RelayStreamAsync(relayParameters, HttpContext.RequestAborted);
         }
 
         // Otherwise download from the provider and stream (quality upgrade logic applies)
@@ -226,7 +237,7 @@ public class SubsonicController : ControllerBase
             // announce the size, the stream returned here starts with the first bytes and
             // follows the download as it grows.
             var (downloadStream, filePath) = await _downloadService.DownloadAndStreamAsync(
-                provider!, externalId!, _hostApplicationLifetime.ApplicationStopping);
+                provider, externalId, _hostApplicationLifetime.ApplicationStopping);
 
             // A client on a metered link asks for a lighter encoding. The download above is
             // unaffected: the library keeps the provider quality, only this response is encoded.
@@ -236,7 +247,7 @@ public class SubsonicController : ControllerBase
                 try
                 {
                     transcoded = await _transcoder.TryTranscodeAsync(downloadStream, filePath,
-                        ReadTranscodeRequest(parameters), HttpContext.RequestAborted);
+                        transcodeRequest, HttpContext.RequestAborted);
                 }
                 catch
                 {
@@ -285,9 +296,10 @@ public class SubsonicController : ControllerBase
     }
 
     /// <summary>
-    /// OpenSubsonic extension used by some clients (e.g. Feishin) to decide whether
-    /// a track can be played directly or needs transcoding. For external songs we
-    /// return a direct-play response so the client proceeds to /rest/stream.
+    /// OpenSubsonic transcoding extension, used by clients such as Feishin and Puffer to decide
+    /// whether a track plays directly or needs transcoding. Library songs are decided by the
+    /// Subsonic server. For ext- songs octo-fiesta decides from the client's capabilities
+    /// (the ClientInfo body) and hands out transcodeParams for getTranscodeStream.
     /// </summary>
     [HttpGet, HttpPost]
     [Route("rest/getTranscodeDecision")]
@@ -332,7 +344,96 @@ public class SubsonicController : ControllerBase
             }
         }
 
-        return _responseBuilder.CreateTranscodeDecisionResponse(song, protocol);
+        // Without the client's capabilities (no body, or an older client), only direct play can be offered
+        var clientInfo = HttpMethods.IsPost(Request.Method) ? ClientInfo.TryParse(await ReadRequestBodyAsync()) : null;
+        if (clientInfo == null || song == null)
+        {
+            return _responseBuilder.CreateTranscodeDecisionResponse(song, protocol);
+        }
+
+        // Only offer transcoding that can actually happen; otherwise the client would expect
+        // a format getTranscodeStream cannot deliver
+        if (_transcoder == null || !await _transcoder.IsAvailableAsync())
+        {
+            clientInfo.TranscodingProfiles.Clear();
+        }
+
+        var (source, lossless) = SubsonicResponseBuilder.DescribeSourceStream(song);
+        var decision = ClientTranscodeNegotiator.Decide(source, lossless, clientInfo);
+        if (!decision.CanDirectPlay && !decision.CanTranscode && clientInfo.TranscodingProfiles.Count == 0)
+        {
+            // Nothing fits and nothing can be encoded: send the original, as before transcoding existed
+            decision = decision with { CanDirectPlay = true, ErrorReason = "", TranscodeParams = TranscodeToken.Raw };
+        }
+
+        _logger.LogInformation(
+            "Transcode decision for {MediaId} ({Client}): source {Container}/{Codec} {SourceRate} kbps -> {Outcome}",
+            mediaId, clientInfo.Name, source.Container, source.Codec, source.BitRate,
+            decision.CanDirectPlay ? "direct play"
+            : decision.TranscodeStream is { } target ? $"{target.Codec} {target.BitRate} kbps"
+            : $"none ({string.Join("; ", decision.TranscodeReasons)})");
+
+        return _responseBuilder.CreateTranscodeDecisionResponse(decision);
+    }
+
+    /// <summary>
+    /// OpenSubsonic transcoding extension: streams a song as getTranscodeDecision decided.
+    /// Library songs are relayed to the Subsonic server, which issued their transcodeParams;
+    /// ext- songs carry octo-fiesta's own and are served like <c>stream</c>.
+    /// </summary>
+    [HttpGet, HttpPost]
+    [Route("rest/getTranscodeStream")]
+    [Route("rest/getTranscodeStream.view")]
+    public async Task<IActionResult> GetTranscodeStream()
+    {
+        var parameters = await ExtractAllParameters();
+        var mediaId = parameters.GetValueOrDefault("mediaId", "");
+        if (string.IsNullOrWhiteSpace(mediaId))
+        {
+            return BadRequest();
+        }
+
+        var (isExternal, provider, externalId) = _localLibraryService.ParseSongId(mediaId);
+        if (!isExternal)
+        {
+            return await _proxyService.RelayStreamAsync(parameters, HttpContext.RequestAborted, "rest/getTranscodeStream");
+        }
+
+        var offset = int.TryParse(parameters.GetValueOrDefault("offset"), out var seconds) && seconds > 0 ? seconds : 0;
+        var request = TranscodeToken.TryParse(parameters.GetValueOrDefault("transcodeParams"), offset);
+        if (request == null)
+        {
+            // Same answer as Navidrome for a token it did not issue: ask for a new decision
+            return StatusCode(StatusCodes.Status410Gone);
+        }
+
+        // A library copy goes through the Subsonic server's classic stream endpoint
+        var relayParameters = new Dictionary<string, string>(parameters);
+        foreach (var key in new[] { "mediaId", "mediaType", "transcodeParams", "offset" })
+        {
+            relayParameters.Remove(key);
+        }
+        relayParameters["format"] = request.Format ?? "raw";
+        if (request.MaxBitRate > 0)
+        {
+            relayParameters["maxBitRate"] = request.MaxBitRate.ToString(System.Globalization.CultureInfo.InvariantCulture);
+        }
+        if (offset > 0)
+        {
+            relayParameters["timeOffset"] = offset.ToString(System.Globalization.CultureInfo.InvariantCulture);
+        }
+
+        return await ServeExternalSongAsync(provider!, externalId!, relayParameters, request);
+    }
+
+    private async Task<string> ReadRequestBodyAsync()
+    {
+        Request.EnableBuffering();
+        Request.Body.Position = 0;
+        using var reader = new StreamReader(Request.Body, Encoding.UTF8, leaveOpen: true);
+        var body = await reader.ReadToEndAsync();
+        Request.Body.Position = 0;
+        return body;
     }
 
     /// <summary>
