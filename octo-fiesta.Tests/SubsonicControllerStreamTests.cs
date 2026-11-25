@@ -9,6 +9,7 @@ using octo_fiesta.Models.Settings;
 using octo_fiesta.Services;
 using octo_fiesta.Services.Local;
 using octo_fiesta.Services.Subsonic;
+using octo_fiesta.Services.Transcoding;
 
 namespace octo_fiesta.Tests;
 
@@ -18,7 +19,9 @@ public class SubsonicControllerStreamTests
         Mock<ILocalLibraryService> localLibraryServiceMock,
         Mock<IDownloadService> downloadServiceMock,
         IHostApplicationLifetime hostApplicationLifetime,
-        CancellationToken requestAbortedToken)
+        CancellationToken requestAbortedToken,
+        IAudioTranscoder? transcoder = null,
+        string query = "?id=ext-deezer-song-123")
     {
         var metadataServiceMock = new Mock<IMusicMetadataService>();
         var requestParser = new SubsonicRequestParser();
@@ -57,10 +60,11 @@ public class SubsonicControllerStreamTests
             modelMapper,
             proxyService,
             hostApplicationLifetime,
-            new Mock<ILogger<SubsonicController>>().Object);
+            new Mock<ILogger<SubsonicController>>().Object,
+            transcoder: transcoder);
 
         var httpContext = new DefaultHttpContext();
-        httpContext.Request.QueryString = new QueryString("?id=ext-deezer-song-123");
+        httpContext.Request.QueryString = new QueryString(query);
         httpContext.RequestAborted = requestAbortedToken;
 
         controller.ControllerContext = new ControllerContext
@@ -177,5 +181,88 @@ public class SubsonicControllerStreamTests
         downloadServiceMock.Verify(
             x => x.DownloadAndStreamAsync("deezer", "123", It.Is<CancellationToken>(t => t.IsCancellationRequested)),
             Times.Once);
+    }
+
+    [Fact]
+    public async Task Stream_WhenClientAsksForLighterEncoding_ServesTranscodedStream()
+    {
+        var localLibraryServiceMock = new Mock<ILocalLibraryService>();
+        localLibraryServiceMock
+            .Setup(x => x.ParseSongId(It.IsAny<string>()))
+            .Returns((true, "deezer", "123"));
+
+        var source = new MemoryStream([1, 2, 3]);
+        var downloadServiceMock = new Mock<IDownloadService>();
+        downloadServiceMock
+            .Setup(x => x.DownloadAndStreamAsync("deezer", "123", It.IsAny<CancellationToken>()))
+            .ReturnsAsync(((Stream)source, "01 - Song.flac"));
+
+        var encoded = new MemoryStream([9, 9, 9]);
+        TranscodeRequest? captured = null;
+        var transcoderMock = new Mock<IAudioTranscoder>();
+        transcoderMock
+            .Setup(x => x.TryTranscodeAsync(source, "01 - Song.flac", It.IsAny<TranscodeRequest>(), It.IsAny<CancellationToken>()))
+            .Callback<Stream, string, TranscodeRequest, CancellationToken>((_, _, request, _) => captured = request)
+            .ReturnsAsync(new TranscodedStream(encoded, new TranscodeTarget(TranscodeProfile.Mp3, 128)));
+
+        var hostLifetimeMock = new Mock<IHostApplicationLifetime>();
+        hostLifetimeMock.SetupGet(x => x.ApplicationStopping).Returns(CancellationToken.None);
+
+        var controller = CreateController(
+            localLibraryServiceMock,
+            downloadServiceMock,
+            hostLifetimeMock.Object,
+            CancellationToken.None,
+            transcoderMock.Object,
+            "?id=ext-deezer-song-123&maxBitRate=128&format=mp3&timeOffset=30");
+
+        var result = await controller.Stream();
+
+        var fileResult = Assert.IsType<FileStreamResult>(result);
+        Assert.Same(encoded, fileResult.FileStream);
+        Assert.Equal("audio/mpeg", fileResult.ContentType);
+        // An encoder's output has no byte offsets to seek to
+        Assert.False(fileResult.EnableRangeProcessing);
+        Assert.Equal(new TranscodeRequest("mp3", 128, 30), captured);
+        // The download itself is requested as usual: the library keeps the original quality
+        downloadServiceMock.Verify(x => x.DownloadAndStreamAsync("deezer", "123", It.IsAny<CancellationToken>()), Times.Once);
+    }
+
+    [Fact]
+    public async Task Stream_WhenTranscoderDeclines_ServesOriginalWithRanges()
+    {
+        var localLibraryServiceMock = new Mock<ILocalLibraryService>();
+        localLibraryServiceMock
+            .Setup(x => x.ParseSongId(It.IsAny<string>()))
+            .Returns((true, "deezer", "123"));
+
+        var source = new MemoryStream([1, 2, 3]);
+        var downloadServiceMock = new Mock<IDownloadService>();
+        downloadServiceMock
+            .Setup(x => x.DownloadAndStreamAsync("deezer", "123", It.IsAny<CancellationToken>()))
+            .ReturnsAsync(((Stream)source, "01 - Song.flac"));
+
+        var transcoderMock = new Mock<IAudioTranscoder>();
+        transcoderMock
+            .Setup(x => x.TryTranscodeAsync(It.IsAny<Stream>(), It.IsAny<string>(), It.IsAny<TranscodeRequest>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync((TranscodedStream?)null);
+
+        var hostLifetimeMock = new Mock<IHostApplicationLifetime>();
+        hostLifetimeMock.SetupGet(x => x.ApplicationStopping).Returns(CancellationToken.None);
+
+        var controller = CreateController(
+            localLibraryServiceMock,
+            downloadServiceMock,
+            hostLifetimeMock.Object,
+            CancellationToken.None,
+            transcoderMock.Object,
+            "?id=ext-deezer-song-123&format=raw");
+
+        var result = await controller.Stream();
+
+        var fileResult = Assert.IsType<FileStreamResult>(result);
+        Assert.Same(source, fileResult.FileStream);
+        Assert.Equal("audio/flac", fileResult.ContentType);
+        Assert.True(fileResult.EnableRangeProcessing);
     }
 }

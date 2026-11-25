@@ -15,6 +15,7 @@ using octo_fiesta.Services.Local;
 using octo_fiesta.Services.Lyrics;
 using octo_fiesta.Services.SquidWTF;
 using octo_fiesta.Services.Subsonic;
+using octo_fiesta.Services.Transcoding;
 
 namespace octo_fiesta.Controllers;
 
@@ -33,6 +34,7 @@ public class SubsonicController : ControllerBase
     private readonly PlaylistSyncService? _playlistSyncService;
     private readonly ILyricsService? _lyricsService;
     private readonly ExternalCoverArtService _coverArt;
+    private readonly IAudioTranscoder? _transcoder;
     private readonly ILogger<SubsonicController> _logger;
     private readonly IHostApplicationLifetime _hostApplicationLifetime;
 
@@ -49,7 +51,8 @@ public class SubsonicController : ControllerBase
         ILogger<SubsonicController> logger,
         PlaylistSyncService? playlistSyncService = null,
         ILyricsService? lyricsService = null,
-        ExternalCoverArtService? coverArt = null)
+        ExternalCoverArtService? coverArt = null,
+        IAudioTranscoder? transcoder = null)
     {
         _subsonicSettings = subsonicSettings.Value;
         _metadataService = metadataService;
@@ -63,6 +66,7 @@ public class SubsonicController : ControllerBase
         _playlistSyncService = playlistSyncService;
         _lyricsService = lyricsService;
         _logger = logger;
+        _transcoder = transcoder;
         _coverArt = coverArt ?? new ExternalCoverArtService(metadataService,
             Microsoft.Extensions.Logging.Abstractions.NullLogger<ExternalCoverArtService>.Instance,
             settings: subsonicSettings);
@@ -223,12 +227,46 @@ public class SubsonicController : ControllerBase
             // follows the download as it grows.
             var (downloadStream, filePath) = await _downloadService.DownloadAndStreamAsync(
                 provider!, externalId!, _hostApplicationLifetime.ApplicationStopping);
+
+            // A client on a metered link asks for a lighter encoding. The download above is
+            // unaffected: the library keeps the provider quality, only this response is encoded.
+            if (_transcoder != null)
+            {
+                TranscodedStream? transcoded;
+                try
+                {
+                    transcoded = await _transcoder.TryTranscodeAsync(downloadStream, filePath,
+                        ReadTranscodeRequest(parameters), HttpContext.RequestAborted);
+                }
+                catch
+                {
+                    await downloadStream.DisposeAsync();
+                    throw;
+                }
+
+                if (transcoded != null)
+                {
+                    return File(transcoded.Stream, transcoded.ContentType, enableRangeProcessing: false);
+                }
+            }
+
             return File(downloadStream, GetContentType(filePath), enableRangeProcessing: true);
         }
         catch (Exception ex)
         {
             return StatusCode(500, new { error = $"Failed to stream: {ex.Message}" });
         }
+    }
+
+    private static TranscodeRequest ReadTranscodeRequest(Dictionary<string, string> parameters)
+    {
+        var format = parameters.GetValueOrDefault("format");
+        var maxBitRate = int.TryParse(parameters.GetValueOrDefault("maxBitRate"), out var rate) && rate > 0 ? rate : 0;
+        var timeOffset = double.TryParse(parameters.GetValueOrDefault("timeOffset"),
+            System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var offset) && offset > 0
+            ? offset
+            : 0;
+        return new TranscodeRequest(string.IsNullOrWhiteSpace(format) ? null : format, maxBitRate, timeOffset);
     }
 
     /// <summary>

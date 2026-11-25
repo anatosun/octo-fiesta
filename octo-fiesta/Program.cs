@@ -9,6 +9,7 @@ using octo_fiesta.Services.Local;
 using octo_fiesta.Services.Lyrics;
 using octo_fiesta.Services.Validation;
 using octo_fiesta.Services.Subsonic;
+using octo_fiesta.Services.Transcoding;
 using octo_fiesta.Services.Common;
 using octo_fiesta.Middleware;
 
@@ -66,6 +67,7 @@ builder.Services.AddSingleton<SubsonicRequestParser>();
 builder.Services.AddSingleton<SubsonicResponseBuilder>();
 builder.Services.AddSingleton<SubsonicModelMapper>();
 builder.Services.AddSingleton<ExternalCoverArtService>();
+builder.Services.AddSingleton<IAudioTranscoder, FfmpegAudioTranscoder>();
 builder.Services.AddScoped<SubsonicProxyService>();
 
 // Lyrics lookup (LRCLIB). Always registered; gated at runtime by Lyrics:Enabled.
